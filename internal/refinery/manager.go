@@ -249,13 +249,217 @@ func (m *Manager) branchToMR(branch string) *MergeRequest {
 
 // run is the main processing loop (for foreground mode).
 func (m *Manager) run(ref *Refinery) error {
-	// MVP: Just a stub that returns immediately
-	// Full implementation in gt-ov2
-	fmt.Println("Refinery running (stub mode)...")
+	fmt.Println("Refinery running...")
 	fmt.Println("Press Ctrl+C to stop")
 
-	// Would normally loop here processing the queue
-	select {}
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			// Process queue
+			if err := m.ProcessQueue(); err != nil {
+				fmt.Printf("Queue processing error: %v\n", err)
+			}
+		}
+	}
+}
+
+// ProcessQueue processes all pending merge requests.
+func (m *Manager) ProcessQueue() error {
+	queue, err := m.Queue()
+	if err != nil {
+		return err
+	}
+
+	for _, item := range queue {
+		if item.MR.Status != MRPending {
+			continue
+		}
+
+		fmt.Printf("Processing: %s (%s)\n", item.MR.Branch, item.MR.Worker)
+
+		result := m.ProcessMR(item.MR)
+		if result.Success {
+			fmt.Printf("  ✓ Merged successfully\n")
+		} else {
+			fmt.Printf("  ✗ Failed: %s\n", result.Error)
+		}
+	}
+
+	return nil
+}
+
+// MergeResult contains the result of a merge attempt.
+type MergeResult struct {
+	Success   bool
+	Error     string
+	Conflict  bool
+	TestsFailed bool
+}
+
+// ProcessMR processes a single merge request.
+func (m *Manager) ProcessMR(mr *MergeRequest) MergeResult {
+	ref, _ := m.loadState()
+
+	// Set current MR
+	ref.CurrentMR = mr
+	mr.Status = MRProcessing
+	m.saveState(ref)
+
+	result := MergeResult{}
+
+	// 1. Fetch the branch
+	if err := m.gitRun("fetch", "origin", mr.Branch); err != nil {
+		result.Error = fmt.Sprintf("fetch failed: %v", err)
+		m.completeMR(mr, MRFailed, result.Error)
+		return result
+	}
+
+	// 2. Attempt merge to target branch
+	// First, checkout target
+	if err := m.gitRun("checkout", mr.TargetBranch); err != nil {
+		result.Error = fmt.Sprintf("checkout target failed: %v", err)
+		m.completeMR(mr, MRFailed, result.Error)
+		return result
+	}
+
+	// Pull latest
+	m.gitRun("pull", "origin", mr.TargetBranch) // Ignore errors
+
+	// Merge
+	err := m.gitRun("merge", "--no-ff", "-m",
+		fmt.Sprintf("Merge %s from %s", mr.Branch, mr.Worker),
+		"origin/"+mr.Branch)
+
+	if err != nil {
+		errStr := err.Error()
+		if strings.Contains(errStr, "CONFLICT") || strings.Contains(errStr, "conflict") {
+			result.Conflict = true
+			result.Error = "merge conflict"
+			// Abort the merge
+			m.gitRun("merge", "--abort")
+			m.completeMR(mr, MRFailed, "merge conflict - polecat must rebase")
+			return result
+		}
+		result.Error = fmt.Sprintf("merge failed: %v", err)
+		m.completeMR(mr, MRFailed, result.Error)
+		return result
+	}
+
+	// 3. Run tests if configured
+	testCmd := m.getTestCommand()
+	if testCmd != "" {
+		if err := m.runTests(testCmd); err != nil {
+			result.TestsFailed = true
+			result.Error = fmt.Sprintf("tests failed: %v", err)
+			// Reset to before merge
+			m.gitRun("reset", "--hard", "HEAD~1")
+			m.completeMR(mr, MRFailed, result.Error)
+			return result
+		}
+	}
+
+	// 4. Push
+	if err := m.gitRun("push", "origin", mr.TargetBranch); err != nil {
+		result.Error = fmt.Sprintf("push failed: %v", err)
+		// Reset to before merge
+		m.gitRun("reset", "--hard", "HEAD~1")
+		m.completeMR(mr, MRFailed, result.Error)
+		return result
+	}
+
+	// Success!
+	result.Success = true
+	m.completeMR(mr, MRMerged, "")
+
+	// Optionally delete the merged branch
+	m.gitRun("push", "origin", "--delete", mr.Branch)
+
+	return result
+}
+
+// completeMR marks an MR as complete and updates stats.
+func (m *Manager) completeMR(mr *MergeRequest, status MRStatus, errMsg string) {
+	ref, _ := m.loadState()
+
+	mr.Status = status
+	mr.Error = errMsg
+	ref.CurrentMR = nil
+
+	now := time.Now()
+	switch status {
+	case MRMerged:
+		ref.LastMergeAt = &now
+		ref.Stats.TotalMerged++
+		ref.Stats.TodayMerged++
+	case MRFailed:
+		ref.Stats.TotalFailed++
+		ref.Stats.TodayFailed++
+	case MRSkipped:
+		ref.Stats.TotalSkipped++
+	}
+
+	m.saveState(ref)
+}
+
+// getTestCommand returns the test command if configured.
+func (m *Manager) getTestCommand() string {
+	// Check for .gastown/config.json with test_command
+	configPath := filepath.Join(m.rig.Path, ".gastown", "config.json")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return ""
+	}
+
+	var config struct {
+		TestCommand string `json:"test_command"`
+	}
+	if err := json.Unmarshal(data, &config); err != nil {
+		return ""
+	}
+
+	return config.TestCommand
+}
+
+// runTests executes the test command.
+func (m *Manager) runTests(testCmd string) error {
+	parts := strings.Fields(testCmd)
+	if len(parts) == 0 {
+		return nil
+	}
+
+	cmd := exec.Command(parts[0], parts[1:]...)
+	cmd.Dir = m.workDir
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%s: %s", err, strings.TrimSpace(stderr.String()))
+	}
+
+	return nil
+}
+
+// gitRun executes a git command.
+func (m *Manager) gitRun(args ...string) error {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = m.workDir
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		errMsg := strings.TrimSpace(stderr.String())
+		if errMsg != "" {
+			return fmt.Errorf("%s", errMsg)
+		}
+		return err
+	}
+
+	return nil
 }
 
 // processExists checks if a process with the given PID exists.
