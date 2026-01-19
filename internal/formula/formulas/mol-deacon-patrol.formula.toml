@@ -335,9 +335,35 @@ gt mail send gastown/witness -s "Dependency resolved: <bd-xxx>" \\
 Keep notifications brief and actionable. The recipient can run bd show for details."""
 
 [[steps]]
+id = "stranded-convoy-check"
+title = "Detect and feed stranded convoys"
+needs = ["fire-notifications"]
+description = """
+Detect stranded convoys and dispatch dogs to feed them.
+
+**Step 1: Check for stranded convoys**
+```bash
+gt convoy stranded --json
+```
+
+If empty, skip to exit.
+
+**Step 2: For each stranded convoy, dispatch a dog**
+```bash
+gt sling mol-convoy-feed deacon/dogs --var convoy=<convoy-id>
+```
+
+**Defensive behavior:**
+- If no stranded convoys, skip silently
+- If dispatch fails, log and continue
+- Don't block patrol on dog completion
+
+**Exit criteria:** All stranded convoys have dogs dispatched."""
+
+[[steps]]
 id = "health-scan"
 title = "Check Witness and Refinery health"
-needs = ["trigger-pending-spawns", "dispatch-gated-molecules", "fire-notifications"]
+needs = ["trigger-pending-spawns", "dispatch-gated-molecules", "fire-notifications", "stranded-convoy-check"]
 description = """
 Check Witness and Refinery health for each rig.
 
