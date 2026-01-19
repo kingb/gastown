@@ -7,6 +7,59 @@ import (
 	"testing"
 )
 
+func TestGetFormulaFromLabels(t *testing.T) {
+	tests := []struct {
+		name   string
+		labels []string
+		want   string
+	}{
+		{
+			name:   "formula label present",
+			labels: []string{"bug", "formula:mol-code-review", "priority:high"},
+			want:   "mol-code-review",
+		},
+		{
+			name:   "no formula label",
+			labels: []string{"bug", "enhancement", "priority:high"},
+			want:   "",
+		},
+		{
+			name:   "empty labels",
+			labels: []string{},
+			want:   "",
+		},
+		{
+			name:   "nil labels",
+			labels: nil,
+			want:   "",
+		},
+		{
+			name:   "formula label only",
+			labels: []string{"formula:mol-review"},
+			want:   "mol-review",
+		},
+		{
+			name:   "multiple formula labels returns first",
+			labels: []string{"formula:mol-first", "formula:mol-second"},
+			want:   "mol-first",
+		},
+		{
+			name:   "partial match not matched",
+			labels: []string{"my-formula:fake", "formulax:bad"},
+			want:   "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := getFormulaFromLabels(tt.labels)
+			if got != tt.want {
+				t.Errorf("getFormulaFromLabels(%v) = %q, want %q", tt.labels, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseWispIDFromJSON(t *testing.T) {
 	tests := []struct {
 		name    string

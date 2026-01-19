@@ -167,6 +167,17 @@ func runSling(cmd *cobra.Command, args []string) error {
 		if err := verifyBeadExists(firstArg); err == nil {
 			// It's a verified bead
 			beadID = firstArg
+
+			// Check for formula: label on the issue
+			if info, err := getBeadInfo(beadID); err == nil {
+				if labelFormula := getFormulaFromLabels(info.Labels); labelFormula != "" {
+					if err := verifyFormulaExists(labelFormula); err == nil {
+						formulaName = labelFormula
+						fmt.Printf("%s Using formula from label: %s\n",
+							style.Dim.Render("○"), labelFormula)
+					}
+				}
+			}
 		} else {
 			// Not a verified bead - try as standalone formula
 			if err := verifyFormulaExists(firstArg); err == nil {

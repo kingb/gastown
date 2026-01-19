@@ -18,9 +18,10 @@ import (
 
 // beadInfo holds status and assignee for a bead.
 type beadInfo struct {
-	Title    string `json:"title"`
-	Status   string `json:"status"`
-	Assignee string `json:"assignee"`
+	Title    string   `json:"title"`
+	Status   string   `json:"status"`
+	Assignee string   `json:"assignee"`
+	Labels   []string `json:"labels"`
 }
 
 // verifyBeadExists checks that the bead exists using bd show.
@@ -76,6 +77,16 @@ func getBeadInfo(beadID string) (*beadInfo, error) {
 		return nil, fmt.Errorf("bead '%s' not found", beadID)
 	}
 	return &infos[0], nil
+}
+
+// getFormulaFromLabels extracts formula name from "formula:xxx" label.
+func getFormulaFromLabels(labels []string) string {
+	for _, label := range labels {
+		if strings.HasPrefix(label, "formula:") {
+			return strings.TrimPrefix(label, "formula:")
+		}
+	}
+	return ""
 }
 
 // storeArgsInBead stores args in the bead's description using attached_args field.
