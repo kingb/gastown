@@ -552,7 +552,8 @@ func defaultProcessNames(provider, command string) []string {
 
 func defaultReadyPromptPrefix(provider string) string {
 	if provider == "claude" {
-		return "> "
+		// Claude Code v2.1+ uses "❯" as prompt character (was "> " in earlier versions)
+		return "❯"
 	}
 	return ""
 }
