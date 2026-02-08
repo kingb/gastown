@@ -247,10 +247,13 @@ func (s *SpawnedPolecatInfo) StartSession() (string, error) {
 		fmt.Printf("Warning: could not update issue status to in_progress: %v\n", err)
 	}
 
-	// Get pane
+	// Get pane — if this fails, the session may have died during startup.
+	// Kill the dead session to prevent "session already running" on next attempt (gt-jn40ft).
 	pane, err := getSessionPane(s.SessionName)
 	if err != nil {
-		return "", fmt.Errorf("getting pane for %s: %w", s.SessionName, err)
+		// Session likely died — clean up the tmux session so it doesn't block re-sling
+		_ = t.KillSession(s.SessionName)
+		return "", fmt.Errorf("getting pane for %s (session likely died during startup): %w", s.SessionName, err)
 	}
 
 	s.Pane = pane

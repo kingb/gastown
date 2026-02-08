@@ -8,7 +8,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
@@ -147,15 +149,19 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 
 	sessionID := m.SessionName(polecat)
 
-	// Check if session already exists
-	// Note: Orphan sessions are cleaned up by ReconcilePool during AllocateName,
-	// so by this point, any existing session should be legitimately in use.
+	// Check if session already exists.
+	// If an existing session's pane process has died, kill the stale session
+	// and proceed rather than returning ErrSessionRunning (gt-jn40ft).
 	running, err := m.tmux.HasSession(sessionID)
 	if err != nil {
 		return fmt.Errorf("checking session: %w", err)
 	}
 	if running {
-		return fmt.Errorf("%w: %s", ErrSessionRunning, sessionID)
+		if m.isSessionStale(sessionID) {
+			debugSession("KillStaleSession", m.tmux.KillSessionWithProcesses(sessionID))
+		} else {
+			return fmt.Errorf("%w: %s", ErrSessionRunning, sessionID)
+		}
 	}
 
 	// Determine working directory
@@ -292,6 +298,29 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 	}
 
 	return nil
+}
+
+// isSessionStale checks if a tmux session's pane process has died.
+// A stale session exists in tmux but its main process (the agent) is no longer running.
+// This happens when the agent crashes during startup but tmux keeps the dead pane.
+func (m *SessionManager) isSessionStale(sessionID string) bool {
+	pidStr, err := m.tmux.GetPanePID(sessionID)
+	if err != nil || pidStr == "" {
+		return true // Can't get PID → session is stale
+	}
+	pid, err := strconv.Atoi(pidStr)
+	if err != nil {
+		return true
+	}
+	// On Unix, Signal(0) checks if process exists without sending a signal
+	p, err := os.FindProcess(pid)
+	if err != nil {
+		return true
+	}
+	if err := p.Signal(syscall.Signal(0)); err != nil {
+		return true // Process doesn't exist → stale
+	}
+	return false
 }
 
 // Stop terminates a polecat session.

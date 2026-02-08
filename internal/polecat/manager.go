@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
@@ -1023,12 +1024,18 @@ func (m *Manager) ReconcilePoolWith(namesWithDirs, namesWithSessions []string) {
 		dirSet[name] = true
 	}
 
-	// Kill orphaned sessions (session exists but no directory).
+	// Kill orphaned or stale sessions.
+	// - No directory: orphan session, always kill (worktree was removed but tmux lingered)
+	// - Has directory but dead process: stale session from crashed startup (gt-jn40ft)
 	// Use KillSessionWithProcesses to ensure all descendant processes are killed.
 	if m.tmux != nil {
 		for _, name := range namesWithSessions {
+			sessionName := fmt.Sprintf("gt-%s-%s", m.rig.Name, name)
 			if !dirSet[name] {
-				sessionName := fmt.Sprintf("gt-%s-%s", m.rig.Name, name)
+				// Orphan: session exists but no directory
+				_ = m.tmux.KillSessionWithProcesses(sessionName)
+			} else if isSessionProcessDead(m.tmux, sessionName) {
+				// Stale: directory exists but session's process has died
 				_ = m.tmux.KillSessionWithProcesses(sessionName)
 			}
 		}
@@ -1039,6 +1046,28 @@ func (m *Manager) ReconcilePoolWith(namesWithDirs, namesWithSessions []string) {
 
 	// Clean up orphaned polecat state (fixes #698)
 	m.cleanupOrphanPolecatState()
+}
+
+// isSessionProcessDead checks if a tmux session's pane process has exited.
+// Returns true if the process is dead or cannot be checked (conservative: allows cleanup).
+func isSessionProcessDead(t *tmux.Tmux, sessionName string) bool {
+	pidStr, err := t.GetPanePID(sessionName)
+	if err != nil || pidStr == "" {
+		return true
+	}
+	pid, err := strconv.Atoi(pidStr)
+	if err != nil {
+		return true
+	}
+	p, err := os.FindProcess(pid)
+	if err != nil {
+		return true
+	}
+	// On Unix, Signal(0) checks if process exists without sending a signal
+	if err := p.Signal(syscall.Signal(0)); err != nil {
+		return true
+	}
+	return false
 }
 
 // cleanupOrphanPolecatState removes partial/broken polecat state during allocation.
