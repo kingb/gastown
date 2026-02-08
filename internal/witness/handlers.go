@@ -547,15 +547,15 @@ func getCleanupStatus(workDir, rigName, polecatName string) string {
 		return ""
 	}
 
-	// Parse the JSON response
-	var resp agentBeadResponse
-	if err := json.Unmarshal([]byte(output), &resp); err != nil {
+	// Parse the JSON response — bd show --json returns an array
+	var issues []agentBeadResponse
+	if err := json.Unmarshal([]byte(output), &issues); err != nil || len(issues) == 0 {
 		return ""
 	}
 
 	// Parse cleanup_status from description
 	// Description format has "cleanup_status: <value>" line
-	for _, line := range strings.Split(resp.Description, "\n") {
+	for _, line := range strings.Split(issues[0].Description, "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(strings.ToLower(line), "cleanup_status:") {
 			value := strings.TrimSpace(strings.TrimPrefix(line, "cleanup_status:"))
