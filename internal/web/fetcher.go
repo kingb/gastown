@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -115,7 +116,11 @@ func (f *LiveConvoyFetcher) FetchConvoys() ([]ConvoyRow, error) {
 		}
 
 		// Get tracked issues for progress and activity calculation
-		tracked := f.getTrackedIssues(c.ID)
+		tracked, err := f.getTrackedIssues(c.ID)
+		if err != nil {
+			log.Printf("warning: skipping convoy %s: %v", c.ID, err)
+			continue
+		}
 		row.Total = len(tracked)
 
 		var mostRecentActivity time.Time
@@ -214,18 +219,18 @@ func extractIssueID(id string) string {
 }
 
 // getTrackedIssues fetches tracked issues for a convoy.
-func (f *LiveConvoyFetcher) getTrackedIssues(convoyID string) []trackedIssueInfo {
+func (f *LiveConvoyFetcher) getTrackedIssues(convoyID string) ([]trackedIssueInfo, error) {
 	// Query tracked dependencies using bd dep list
 	stdout, err := runBdCmd(f.townRoot, "dep", "list", convoyID, "-t", "tracks", "--json")
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("querying tracked issues for %s: %w", convoyID, err)
 	}
 
 	var deps []struct {
 		ID string `json:"id"`
 	}
 	if err := json.Unmarshal(stdout.Bytes(), &deps); err != nil {
-		return nil
+		return nil, fmt.Errorf("parsing tracked issues for %s: %w", convoyID, err)
 	}
 
 	// Collect resolved issue IDs, unwrapping external:prefix:id format
@@ -262,7 +267,7 @@ func (f *LiveConvoyFetcher) getTrackedIssues(convoyID string) []trackedIssueInfo
 		result = append(result, info)
 	}
 
-	return result
+	return result, nil
 }
 
 // issueDetail holds basic issue info.

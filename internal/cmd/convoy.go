@@ -566,7 +566,10 @@ func checkSingleConvoy(townBeads, convoyID string, dryRun bool) error {
 	}
 
 	// Get tracked issues
-	tracked := getTrackedIssues(townBeads, convoyID)
+	tracked, err := getTrackedIssues(townBeads, convoyID)
+	if err != nil {
+		return fmt.Errorf("checking convoy %s: %w", convoyID, err)
+	}
 	if len(tracked) == 0 {
 		fmt.Printf("%s Convoy %s has no tracked issues\n", style.Dim.Render("○"), convoyID)
 		return nil
@@ -785,7 +788,11 @@ func findStrandedConvoys(townBeads string) ([]strandedConvoyInfo, error) {
 
 	// Check each convoy for stranded state
 	for _, convoy := range convoys {
-		tracked := getTrackedIssues(townBeads, convoy.ID)
+		tracked, err := getTrackedIssues(townBeads, convoy.ID)
+		if err != nil {
+			style.PrintWarning("skipping convoy %s: %v", convoy.ID, err)
+			continue
+		}
 		if len(tracked) == 0 {
 			continue
 		}
@@ -913,7 +920,11 @@ func checkAndCloseCompletedConvoys(townBeads string, dryRun bool) ([]struct{ ID,
 
 	// Check each convoy
 	for _, convoy := range convoys {
-		tracked := getTrackedIssues(townBeads, convoy.ID)
+		tracked, err := getTrackedIssues(townBeads, convoy.ID)
+		if err != nil {
+			style.PrintWarning("skipping convoy %s: %v", convoy.ID, err)
+			continue
+		}
 		if len(tracked) == 0 {
 			continue // No tracked issues, nothing to check
 		}
@@ -1061,7 +1072,10 @@ func runConvoyStatus(cmd *cobra.Command, args []string) error {
 		IssueType string `json:"issue_type"`
 	}
 
-	tracked := getTrackedIssues(townBeads, convoyID)
+	tracked, err := getTrackedIssues(townBeads, convoyID)
+	if err != nil {
+		return fmt.Errorf("getting tracked issues for %s: %w", convoyID, err)
+	}
 
 	// Count completed
 	completed := 0
@@ -1227,7 +1241,11 @@ func runConvoyList(cmd *cobra.Command, args []string) error {
 		}
 		enriched := make([]convoyListEntry, 0, len(convoys))
 		for _, c := range convoys {
-			tracked := getTrackedIssues(townBeads, c.ID)
+			tracked, err := getTrackedIssues(townBeads, c.ID)
+			if err != nil {
+				style.PrintWarning("skipping convoy %s: %v", c.ID, err)
+				continue
+			}
 			if tracked == nil {
 				tracked = []trackedIssueInfo{} // Ensure JSON [] not null
 			}
@@ -1282,7 +1300,11 @@ func printConvoyTree(townBeads string, convoys []struct {
 }) error {
 	for _, c := range convoys {
 		// Get tracked issues for this convoy
-		tracked := getTrackedIssues(townBeads, c.ID)
+		tracked, err := getTrackedIssues(townBeads, c.ID)
+		if err != nil {
+			style.PrintWarning("skipping convoy %s: %v", c.ID, err)
+			continue
+		}
 
 		// Count completed
 		completed := 0
@@ -1368,7 +1390,7 @@ func extractIssueID(id string) string {
 
 // getTrackedIssues uses bd dep list to get issues tracked by a convoy.
 // Returns issue details including status, type, and worker info.
-func getTrackedIssues(townBeads, convoyID string) []trackedIssueInfo {
+func getTrackedIssues(townBeads, convoyID string) ([]trackedIssueInfo, error) {
 	// Use bd dep list to get tracked dependencies
 	// Run from town root (parent of .beads) so bd routes correctly
 	townRoot := filepath.Dir(townBeads)
@@ -1378,7 +1400,7 @@ func getTrackedIssues(townBeads, convoyID string) []trackedIssueInfo {
 	var stdout bytes.Buffer
 	depCmd.Stdout = &stdout
 	if err := depCmd.Run(); err != nil {
-		return nil
+		return nil, fmt.Errorf("querying tracked issues for %s: %w", convoyID, err)
 	}
 
 	// Parse the JSON output - bd dep list returns full issue details
@@ -1392,7 +1414,7 @@ func getTrackedIssues(townBeads, convoyID string) []trackedIssueInfo {
 		Labels         []string `json:"labels"`
 	}
 	if err := json.Unmarshal(stdout.Bytes(), &deps); err != nil {
-		return nil
+		return nil, fmt.Errorf("parsing tracked issues for %s: %w", convoyID, err)
 	}
 
 	// Unwrap external:prefix:id format from dep IDs before use
@@ -1453,7 +1475,7 @@ func getTrackedIssues(townBeads, convoyID string) []trackedIssueInfo {
 		tracked = append(tracked, info)
 	}
 
-	return tracked
+	return tracked, nil
 }
 
 // getExternalIssueDetails fetches issue details from an external rig database.
