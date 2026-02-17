@@ -241,7 +241,7 @@ func NewGtEventsSource(townRoot string) (*GtEventsSource, error) {
 
 	source := &GtEventsSource{
 		file:   file,
-		events: make(chan Event, 100),
+		events: make(chan Event, 200),
 		cancel: cancel,
 	}
 
@@ -256,6 +256,10 @@ func (s *GtEventsSource) tail(ctx context.Context) {
 
 	// Load recent events (last 200 lines) for initial display
 	s.loadRecentEvents()
+
+	// Seek to true EOF so the tail scanner starts cleanly,
+	// regardless of the preload scanner's internal read-ahead buffer.
+	_, _ = s.file.Seek(0, 2)
 
 	// Now tail for new events
 	scanner := bufio.NewScanner(s.file)
@@ -281,27 +285,40 @@ func (s *GtEventsSource) tail(ctx context.Context) {
 }
 
 // loadRecentEvents reads the last N lines of the file and emits them as events.
+// Uses a ring buffer so memory is O(maxLines) regardless of file size.
 func (s *GtEventsSource) loadRecentEvents() {
 	const maxLines = 200
 
-	// Read entire file to find the last N lines
 	if _, err := s.file.Seek(0, 0); err != nil {
 		return
 	}
 
-	var lines []string
+	// Ring buffer: only keep the last maxLines lines in memory
+	ring := make([]string, maxLines)
+	idx := 0
+	count := 0
+
 	scanner := bufio.NewScanner(s.file)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
+		ring[idx%maxLines] = scanner.Text()
+		idx++
+		count++
+	}
+	if scanner.Err() != nil {
+		// Scanner failed (e.g. token too long) — seek to EOF so tail starts clean
+		_, _ = s.file.Seek(0, 2)
+		return
 	}
 
-	// Take last maxLines
-	start := 0
-	if len(lines) > maxLines {
-		start = len(lines) - maxLines
+	// Emit lines in order (oldest first)
+	n := count
+	if n > maxLines {
+		n = maxLines
 	}
-
-	for _, line := range lines[start:] {
+	start := idx - n
+	for i := start; i < idx; i++ {
+		line := ring[i%maxLines]
 		if event := parseGtEventLine(line); event != nil {
 			select {
 			case s.events <- *event:
