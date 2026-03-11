@@ -845,6 +845,15 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 	// Track PID for defense-in-depth orphan cleanup (non-fatal)
 	_ = session.TrackSessionPID(townRoot, sessionID, t)
 
+	// Set auto-respawn hook for crew resilience.
+	// When Claude exits (context limit, crash, /exit), tmux will automatically respawn it.
+	// This gives crew the same pane-died auto-respawn that the deacon has.
+	if err := t.SetAutoRespawnHook(sessionID); err != nil {
+		// Non-fatal: crew member still works, just won't auto-respawn on crash
+		// Witness zombie detection will still restart it, but with a delay
+		style.PrintWarning("failed to set auto-respawn hook for crew member %s: %v", name, err)
+	}
+
 	// Wait for the agent to start, then accept any startup dialogs that appear.
 	// Workspace trust dialog is independent of bypass permissions and can appear
 	// for any agent, so we always check for non-interactive sessions.
