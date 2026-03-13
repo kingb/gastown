@@ -37,10 +37,10 @@ If `"stale": false`, record success wisp and exit early.
 
 ## Action
 
-Rebuild from source:
+Rebuild from source. Find the crew directory with a valid checkout:
 
 ```bash
-cd ~/gt/gastown/crew/george && make build && make install
+cd ~/gt/gastown/crew/$(ls ~/gt/gastown/crew | head -1) && make build && make install
 ```
 
 ## Record Result
