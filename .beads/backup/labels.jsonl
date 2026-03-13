@@ -1,3 +1,7 @@
+{"issue_id":"gs-acb","label":"plugin:rebuild-gt"}
+{"issue_id":"gs-acb","label":"result:success"}
+{"issue_id":"gs-acb","label":"rig:gastown"}
+{"issue_id":"gs-acb","label":"type:plugin-run"}
 {"issue_id":"gs-qg3","label":"gt-cli"}
 {"issue_id":"gs-qg3","label":"tooling"}
 {"issue_id":"gs-rig-gastown","label":"gt:rig"}
