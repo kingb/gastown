@@ -22,21 +22,22 @@ severity = "low"
 Identifies and kills zombie tmux sessions (wrong prefix, no registered rig)
 and orphaned dog sessions (tmux session exists but dog not in kennel).
 
-## Step 1: Get valid rig prefixes
+## Step 1: Get known session IDs
 
-Fetch the rig registry to know which session prefixes are legitimate:
+Fetch authoritative session IDs from `gt session list` — these are the exact
+tmux session names Gas Town manages (rig agents + polecats):
 
 ```bash
-RIG_JSON=$(gt rig list --json 2>/dev/null)
-if [ $? -ne 0 ] || [ -z "$RIG_JSON" ]; then
-  echo "SKIP: could not get rig list"
+SESSION_JSON=$(gt session list --json 2>/dev/null)
+if [ $? -ne 0 ] || [ -z "$SESSION_JSON" ]; then
+  echo "SKIP: could not get session list"
   exit 0
 fi
 
-# Extract rig names as valid prefixes
-VALID_PREFIXES=$(echo "$RIG_JSON" | jq -r '.[].name // empty' 2>/dev/null)
-if [ -z "$VALID_PREFIXES" ]; then
-  echo "SKIP: no rigs found in registry"
+# Extract session IDs into a newline-delimited list
+KNOWN_SESSIONS=$(echo "$SESSION_JSON" | jq -r '.[].session_id // empty' 2>/dev/null)
+if [ -z "$KNOWN_SESSIONS" ]; then
+  echo "SKIP: no sessions found in registry"
   exit 0
 fi
 ```
@@ -55,37 +56,48 @@ SESSION_COUNT=$(echo "$SESSIONS" | wc -l | tr -d ' ')
 
 ## Step 3: Identify zombie sessions
 
-A session is legitimate if its prefix matches a known rig or the `hq` namespace.
-Gas Town sessions follow the pattern `<prefix>-<role>-<name>` (e.g., `hq-dog-alpha`,
-`gastown-witness`, `gastown-polecat-slit`).
+A session is legitimate if it exactly matches a known session ID from
+`gt session list` or belongs to the `hq-*` namespace (town-level agents:
+deacon, dogs, mayor — not tracked in `gt session list`).
 
 ```bash
 ZOMBIES=()
+RIG_SESSION_COUNT=0
 
 while IFS= read -r SESSION; do
   [ -z "$SESSION" ] && continue
 
-  # Extract prefix (everything before the first dash)
-  PREFIX=$(echo "$SESSION" | cut -d'-' -f1)
+  # Allow hq-* sessions (town-level agents: deacon, dogs, mayor)
+  case "$SESSION" in
+    hq-*) continue ;;
+  esac
 
-  # Allow hq prefix (town-level agents: deacon, dogs, mayor)
-  if [ "$PREFIX" = "hq" ]; then
-    continue
-  fi
+  # This is a rig-level session — count it for the wipeout guard
+  RIG_SESSION_COUNT=$((RIG_SESSION_COUNT + 1))
 
-  # Check against valid rig prefixes
+  # Check against known session IDs (exact match)
   VALID=false
-  while IFS= read -r RIG; do
-    if [ "$PREFIX" = "$RIG" ]; then
+  while IFS= read -r KNOWN; do
+    if [ "$SESSION" = "$KNOWN" ]; then
       VALID=true
       break
     fi
-  done <<< "$VALID_PREFIXES"
+  done <<< "$KNOWN_SESSIONS"
 
   if [ "$VALID" = "false" ]; then
     ZOMBIES+=("$SESSION")
   fi
 done <<< "$SESSIONS"
+
+# Total-wipeout guard: if every non-hq session would be killed,
+# our detection is broken — not the sessions. Abort and escalate.
+if [ "${#ZOMBIES[@]}" -gt 0 ] && [ "${#ZOMBIES[@]}" -eq "$RIG_SESSION_COUNT" ]; then
+  echo "ABORT: all $RIG_SESSION_COUNT rig sessions flagged as zombies — detection is broken, not sessions"
+  gt escalate "session-hygiene: total-wipeout guard triggered" \
+    -s HIGH \
+    --reason "All $RIG_SESSION_COUNT non-hq sessions would be killed. This indicates the zombie detection logic is broken (gt session list may be stale). Flagged sessions: ${ZOMBIES[*]}"
+  exit 0
+fi
 ```
 
 ## Step 4: Kill zombie sessions

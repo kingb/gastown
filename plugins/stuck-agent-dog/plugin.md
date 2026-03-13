@@ -31,27 +31,33 @@ Reference: WAR-ROOM-SERIAL-KILLER.md, commit f3d47a96.
 
 ## Step 1: Enumerate agents to check
 
-Gather all polecats and the deacon session. We check both crashed sessions
+Gather all polecats from `gt session list`. We check both crashed sessions
 (session dead, work on hook) and stuck sessions (session alive but agent hung).
+Skip witness/refinery — they have their own health monitoring.
 
 ```bash
 echo "=== Stuck Agent Dog: Checking agent health ==="
 
 TOWN_ROOT="$HOME/gt"
 
-# Get all rig names
-RIG_JSON=$(gt rig list --json 2>/dev/null)
-if [ $? -ne 0 ] || [ -z "$RIG_JSON" ]; then
-  echo "SKIP: could not get rig list"
+# Get all sessions from gt session list (authoritative source)
+SESSION_JSON=$(gt session list --json 2>/dev/null)
+if [ $? -ne 0 ] || [ -z "$SESSION_JSON" ]; then
+  echo "SKIP: could not get session list"
   exit 0
 fi
 
-RIG_NAMES=$(echo "$RIG_JSON" | jq -r '.[].name // empty' 2>/dev/null)
+# Parse into tab-delimited entries: session_id \t rig \t polecat
+# Filter to crew/polecat sessions only (skip witness, refinery)
+POLECAT_ENTRIES=$(echo "$SESSION_JSON" | jq -r '
+  .[] | select(.polecat | test("^(crew-|polecat-)")) |
+  [.session_id, .rig, .polecat] | @tsv
+' 2>/dev/null)
 ```
 
 ## Step 2: Check polecat health
 
-For each rig, enumerate polecats and check their session status.
+For each polecat session from `gt session list`, check its tmux session status.
 A polecat is a concern if:
 - It has hooked work (hook_bead is set)
 - Its tmux session is dead OR the agent process is dead
@@ -61,60 +67,58 @@ CRASHED=()
 STUCK=()
 HEALTHY=0
 
-for RIG in $RIG_NAMES; do
-  # List polecat directories
-  POLECAT_DIR="$TOWN_ROOT/$RIG/polecats"
-  [ -d "$POLECAT_DIR" ] || continue
+while IFS=$'\t' read -r SESSION_ID RIG PCAT_NAME; do
+  [ -z "$SESSION_ID" ] && continue
 
-  for PCAT_PATH in "$POLECAT_DIR"/*/; do
-    [ -d "$PCAT_PATH" ] || continue
-    PCAT_NAME=$(basename "$PCAT_PATH")
-    SESSION_NAME="${RIG}-polecat-${PCAT_NAME}"
+  # Resolve the polecat's beads path (crew-* or legacy polecats/*)
+  case "$PCAT_NAME" in
+    crew-*) PCAT_BEADS_PATH="$RIG/$PCAT_NAME" ;;
+    *)      PCAT_BEADS_PATH="$RIG/polecats/$PCAT_NAME" ;;
+  esac
 
-    # Check if session exists
-    if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
-      # Session dead — check if it has hooked work
-      HOOK_BEAD=$(bd show "$RIG/polecats/$PCAT_NAME" --json 2>/dev/null \
-        | jq -r '.hook_bead // empty' 2>/dev/null)
+  # Check if session exists
+  if ! tmux has-session -t "$SESSION_ID" 2>/dev/null; then
+    # Session dead — check if it has hooked work
+    HOOK_BEAD=$(bd show "$PCAT_BEADS_PATH" --json 2>/dev/null \
+      | jq -r '.hook_bead // empty' 2>/dev/null)
 
-      if [ -n "$HOOK_BEAD" ]; then
-        # Check agent_state to avoid interfering with active spawning
-        AGENT_STATE=$(bd show "$RIG/polecats/$PCAT_NAME" --json 2>/dev/null \
-          | jq -r '.agent_state // empty' 2>/dev/null)
-        if [ "$AGENT_STATE" = "spawning" ]; then
-          echo "  SKIP $SESSION_NAME: agent_state=spawning (sling in progress)"
-          continue
-        fi
-        CRASHED+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD")
-        echo "  CRASHED: $SESSION_NAME (hook=$HOOK_BEAD)"
+    if [ -n "$HOOK_BEAD" ]; then
+      # Check agent_state to avoid interfering with active spawning
+      AGENT_STATE=$(bd show "$PCAT_BEADS_PATH" --json 2>/dev/null \
+        | jq -r '.agent_state // empty' 2>/dev/null)
+      if [ "$AGENT_STATE" = "spawning" ]; then
+        echo "  SKIP $SESSION_ID: agent_state=spawning (sling in progress)"
+        continue
       fi
-    else
-      # Session alive — check for agent process liveness
-      # Capture last 5 lines of pane output to check for signs of life
-      PANE_OUTPUT=$(tmux capture-pane -t "$SESSION_NAME" -p -S -5 2>/dev/null || echo "")
+      CRASHED+=("$SESSION_ID|$RIG|$PCAT_NAME|$HOOK_BEAD")
+      echo "  CRASHED: $SESSION_ID (hook=$HOOK_BEAD)"
+    fi
+  else
+    # Session alive — check for agent process liveness
+    # Capture last 5 lines of pane output to check for signs of life
+    PANE_OUTPUT=$(tmux capture-pane -t "$SESSION_ID" -p -S -5 2>/dev/null || echo "")
 
-      # Check if agent process is running in the session
-      PANE_PID=$(tmux list-panes -t "$SESSION_NAME" -F '#{pane_pid}' 2>/dev/null | head -1)
-      if [ -n "$PANE_PID" ]; then
-        # Check if Claude or another agent process is a descendant
-        AGENT_ALIVE=$(pgrep -P "$PANE_PID" -f 'claude|node|anthropic' 2>/dev/null | head -1)
-        if [ -z "$AGENT_ALIVE" ]; then
-          # Agent process dead but session alive — zombie session
-          HOOK_BEAD=$(bd show "$RIG/polecats/$PCAT_NAME" --json 2>/dev/null \
-            | jq -r '.hook_bead // empty' 2>/dev/null)
-          if [ -n "$HOOK_BEAD" ]; then
-            STUCK+=("$SESSION_NAME|$RIG|$PCAT_NAME|$HOOK_BEAD|agent_dead")
-            echo "  ZOMBIE: $SESSION_NAME (agent dead, session alive, hook=$HOOK_BEAD)"
-          fi
-        else
-          HEALTHY=$((HEALTHY + 1))
+    # Check if agent process is running in the session
+    PANE_PID=$(tmux list-panes -t "$SESSION_ID" -F '#{pane_pid}' 2>/dev/null | head -1)
+    if [ -n "$PANE_PID" ]; then
+      # Check if Claude or another agent process is a descendant
+      AGENT_ALIVE=$(pgrep -P "$PANE_PID" -f 'claude|node|anthropic' 2>/dev/null | head -1)
+      if [ -z "$AGENT_ALIVE" ]; then
+        # Agent process dead but session alive — zombie session
+        HOOK_BEAD=$(bd show "$PCAT_BEADS_PATH" --json 2>/dev/null \
+          | jq -r '.hook_bead // empty' 2>/dev/null)
+        if [ -n "$HOOK_BEAD" ]; then
+          STUCK+=("$SESSION_ID|$RIG|$PCAT_NAME|$HOOK_BEAD|agent_dead")
+          echo "  ZOMBIE: $SESSION_ID (agent dead, session alive, hook=$HOOK_BEAD)"
         fi
       else
         HEALTHY=$((HEALTHY + 1))
       fi
+    else
+      HEALTHY=$((HEALTHY + 1))
     fi
-  done
-done
+  fi
+done <<< "$POLECAT_ENTRIES"
 
 echo ""
 echo "Health summary: ${#CRASHED[@]} crashed, ${#STUCK[@]} stuck, $HEALTHY healthy"
@@ -189,9 +193,9 @@ For each agent requiring restart:
 ```bash
 # For crashed polecats — notify witness to handle restart
 for ENTRY in "${CRASHED[@]}"; do
-  IFS='|' read -r SESSION RIG PCAT HOOK <<< "$ENTRY"
+  IFS='|' read -r SESSION_ID RIG PCAT HOOK <<< "$ENTRY"
 
-  echo "Requesting restart for $RIG/polecats/$PCAT (hook=$HOOK)"
+  echo "Requesting restart for $RIG/$PCAT (session=$SESSION_ID, hook=$HOOK)"
 
   gt mail send "$RIG/witness" \
     -s "RESTART_POLECAT: $RIG/$PCAT" \
@@ -199,6 +203,7 @@ for ENTRY in "${CRASHED[@]}"; do
 Polecat $PCAT crash confirmed by stuck-agent-dog plugin.
 Context-aware inspection completed — agent is genuinely dead.
 
+session_id: $SESSION_ID
 hook_bead: $HOOK
 action: restart requested
 
@@ -209,10 +214,10 @@ done
 
 # For zombie polecats — kill zombie session first, then request restart
 for ENTRY in "${STUCK[@]}"; do
-  IFS='|' read -r SESSION RIG PCAT HOOK REASON <<< "$ENTRY"
+  IFS='|' read -r SESSION_ID RIG PCAT HOOK REASON <<< "$ENTRY"
 
-  echo "Killing zombie session $SESSION and requesting restart"
-  tmux kill-session -t "$SESSION" 2>/dev/null || true
+  echo "Killing zombie session $SESSION_ID and requesting restart"
+  tmux kill-session -t "$SESSION_ID" 2>/dev/null || true
 
   gt mail send "$RIG/witness" \
     -s "RESTART_POLECAT: $RIG/$PCAT (zombie cleared)" \
@@ -220,6 +225,7 @@ for ENTRY in "${STUCK[@]}"; do
 Polecat $PCAT zombie session cleared by stuck-agent-dog plugin.
 Session was alive but agent process was dead.
 
+session_id: $SESSION_ID
 hook_bead: $HOOK
 reason: $REASON
 action: restart requested
