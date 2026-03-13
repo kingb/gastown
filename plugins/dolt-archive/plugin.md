@@ -32,11 +32,25 @@ whether the other layers work.
 
 ```bash
 DOLT_DATA_DIR="$HOME/gt/.dolt-data"
-PROD_DBS=("hq" "beads" "gastown")
 JSONL_EXPORT_DIR="$HOME/gt/.dolt-archive/jsonl"
 DOLT_HOST="127.0.0.1"
 DOLT_PORT=3307
 DOLT_USER="root"
+
+# Auto-discover databases from .dolt-data/ (skip dotfiles, config, pid)
+PROD_DBS=()
+for dir in "$DOLT_DATA_DIR"/*/; do
+  [ -d "$dir" ] || continue
+  db=$(basename "$dir")
+  case "$db" in .* | .dolt*) continue ;; esac
+  PROD_DBS+=("$db")
+done
+
+if [ ${#PROD_DBS[@]} -eq 0 ]; then
+  echo "SKIP: no databases found in $DOLT_DATA_DIR"
+  exit 0
+fi
+echo "Discovered ${#PROD_DBS[@]} databases: ${PROD_DBS[*]}"
 ```
 
 ## Step 1: JSONL export
@@ -57,32 +71,24 @@ for DB in "${PROD_DBS[@]}"; do
 
   echo "Exporting $DB..."
 
-  # Use bd export if available, otherwise query directly
-  if bd export --db "$DB" --format jsonl > "$EXPORT_FILE" 2>/dev/null; then
+  # Use bd export (outputs JSONL to stdout by default)
+  if bd export --db "$DB" -o "$EXPORT_FILE" 2>/dev/null; then
     LINE_COUNT=$(wc -l < "$EXPORT_FILE" | tr -d ' ')
+
+    if [ "$LINE_COUNT" -eq 0 ]; then
+      echo "  $DB: empty (0 issues) — skipping"
+      rm -f "$EXPORT_FILE"
+      continue
+    fi
+
     FILE_SIZE=$(du -h "$EXPORT_FILE" | cut -f1)
     echo "  $DB: $LINE_COUNT issues exported ($FILE_SIZE)"
-
-    # Update latest symlink
     ln -sf "$EXPORT_FILE" "$LATEST_LINK"
     EXPORTED=$((EXPORTED + 1))
   else
-    # Fallback: query Dolt directly for issue data
-    dolt sql -q "SELECT * FROM issues ORDER BY id" \
-      --host "$DOLT_HOST" --port "$DOLT_PORT" -u "$DOLT_USER" \
-      -d "$DB" --no-auto-commit --result-format json \
-      > "$EXPORT_FILE" 2>/dev/null
-
-    if [ $? -eq 0 ] && [ -s "$EXPORT_FILE" ]; then
-      LINE_COUNT=$(wc -l < "$EXPORT_FILE" | tr -d ' ')
-      echo "  $DB: exported via SQL ($LINE_COUNT lines)"
-      ln -sf "$EXPORT_FILE" "$LATEST_LINK"
-      EXPORTED=$((EXPORTED + 1))
-    else
-      echo "  WARN: $DB export failed"
-      rm -f "$EXPORT_FILE"
-      EXPORT_FAILED=$((EXPORT_FAILED + 1))
-    fi
+    echo "  WARN: $DB export failed (bd exit code $?)"
+    rm -f "$EXPORT_FILE"
+    EXPORT_FAILED=$((EXPORT_FAILED + 1))
   fi
 done
 
