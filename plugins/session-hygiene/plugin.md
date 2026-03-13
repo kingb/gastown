@@ -4,7 +4,7 @@ description = "Clean up zombie tmux sessions and orphaned dog sessions"
 version = 1
 
 [gate]
-type = "cooldown"
+type = "manual"
 duration = "30m"
 
 [tracking]
