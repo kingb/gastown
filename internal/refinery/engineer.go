@@ -453,7 +453,9 @@ func (e *Engineer) doMerge(ctx context.Context, branch, target, sourceIssue stri
 	}
 	if len(subChanges) > 0 {
 		// Ensure submodules are initialized in the refinery worktree
-		if initErr := git.InitSubmodules(e.git.WorkDir()); initErr != nil {
+		// Use mayor/rig as reference to avoid re-fetching from remote
+		mayorRig := filepath.Join(e.rig.Path, "mayor", "rig")
+		if initErr := git.InitSubmodules(e.git.WorkDir(), mayorRig); initErr != nil {
 			return ProcessResult{
 				Success: false,
 				Error:   fmt.Sprintf("failed to init submodules in refinery worktree: %v", initErr),
@@ -966,17 +968,26 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 		}
 	}
 
-	// 2. Delete source branch if configured (local and remote)
-	if e.config.DeleteMergedBranches && mr.Branch != "" {
+	// 2. Delete source branch (local and remote).
+	// Polecat branches (polecat/*) are always cleaned up — they are ephemeral
+	// work branches that should never persist after merge. Other branches
+	// respect the DeleteMergedBranches config.
+	isPolecat := strings.HasPrefix(mr.Branch, "polecat/")
+	if mr.Branch != "" && (e.config.DeleteMergedBranches || isPolecat) {
 		if err := e.git.DeleteBranch(mr.Branch, true); err != nil {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to delete local branch %s: %v\n", mr.Branch, err)
 		} else {
 			_, _ = fmt.Fprintf(e.output, "[Engineer] Deleted local branch: %s\n", mr.Branch)
 		}
-		if err := e.git.DeleteRemoteBranch("origin", mr.Branch); err != nil {
-			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to delete remote branch %s: %v\n", mr.Branch, err)
-		} else {
-			_, _ = fmt.Fprintf(e.output, "[Engineer] Deleted remote branch: %s\n", mr.Branch)
+		// Remote delete — only polecat branches. Non-polecat branches may belong
+		// to contributor forks with open upstream PRs; deleting them from origin
+		// causes GitHub to auto-close those PRs via head_ref_delete. (GH#2669)
+		if isPolecat {
+			if err := e.git.DeleteRemoteBranch("origin", mr.Branch); err != nil {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to delete remote branch %s: %v\n", mr.Branch, err)
+			} else {
+				_, _ = fmt.Fprintf(e.output, "[Engineer] Deleted remote branch: %s\n", mr.Branch)
+			}
 		}
 	}
 
@@ -985,7 +996,17 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 	// Run convoy check to auto-close and notify subscribers.
 	e.postMergeConvoyCheck(mr)
 
-	// 4. Log success
+	// 4. Nudge mayor about successful merge so dispatcher can unblock
+	// dependent work. Without this, mayor only discovers completion by polling.
+	// Uses nudge (not mail) to avoid permanent Dolt commits for routine signals (GH#2434).
+	nudgeMsg := fmt.Sprintf("MERGED: %s issue=%s branch=%s", mr.ID, mr.SourceIssue, mr.Branch)
+	nudgeCmd := exec.Command("gt", "nudge", "mayor/", nudgeMsg)
+	nudgeCmd.Dir = e.workDir
+	if err := nudgeCmd.Run(); err != nil {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to nudge mayor about merge: %v\n", err)
+	}
+
+	// 5. Log success
 	_, _ = fmt.Fprintf(e.output, "[Engineer] ✓ Merged: %s (commit: %s)\n", mr.ID, result.MergeCommit)
 }
 
@@ -1030,6 +1051,15 @@ func (e *Engineer) HandleMRInfoFailure(mr *MRInfo, result ProcessResult) {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to nudge %s about merge failure: %v\n", polecatName, err)
 	} else {
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Nudged %s about merge failure (%s)\n", polecatName, failureType)
+	}
+
+	// Nudge mayor about merge failure so dispatcher can unblock or reassign
+	// dependent work immediately. Mirrors the success nudge in HandleMRInfoSuccess.
+	mayorMsg := fmt.Sprintf("MERGE_FAILED: %s issue=%s branch=%s type=%s", mr.ID, mr.SourceIssue, mr.Branch, failureType)
+	mayorCmd := exec.Command("gt", "nudge", "mayor/", mayorMsg)
+	mayorCmd.Dir = e.workDir
+	if err := mayorCmd.Run(); err != nil {
+		_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to nudge mayor about merge failure: %v\n", err)
 	}
 
 	// If this was a conflict, create a conflict-resolution task for dispatch
@@ -1271,7 +1301,7 @@ func (e *Engineer) ListReadyMRs() ([]*MRInfo, error) {
 	// Query beads for all open merge-request issues.
 	// Cannot use ReadyWithType here because bd ready excludes ephemeral beads,
 	// and MRs are ephemeral by design. Use List + manual blocker check instead.
-	issues, err := e.beads.List(beads.ListOptions{
+	issues, err := e.beads.ListMergeRequests(beads.ListOptions{
 		Status:   "open",
 		Label:    "gt:merge-request",
 		Priority: -1, // No priority filter
@@ -1334,7 +1364,7 @@ func (e *Engineer) ListReadyMRs() ([]*MRInfo, error) {
 // This queries beads for blocked merge-request issues.
 func (e *Engineer) ListBlockedMRs() ([]*MRInfo, error) {
 	// Query all merge-request issues (both ready and blocked)
-	issues, err := e.beads.List(beads.ListOptions{
+	issues, err := e.beads.ListMergeRequests(beads.ListOptions{
 		Status:   "open",
 		Label:    "gt:merge-request",
 		Priority: -1, // No priority filter
@@ -1376,7 +1406,7 @@ func (e *Engineer) ListBlockedMRs() ([]*MRInfo, error) {
 // so agents can detect orphaned MRs. Designed for agent-side queue health analysis
 // (ZFC: Go transports data, agent decides what's interesting).
 func (e *Engineer) ListAllOpenMRs() ([]*MRInfo, error) {
-	issues, err := e.beads.List(beads.ListOptions{
+	issues, err := e.beads.ListMergeRequests(beads.ListOptions{
 		Status:   "open",
 		Label:    "gt:merge-request",
 		Priority: -1,
@@ -1412,7 +1442,7 @@ func (e *Engineer) ListAllOpenMRs() ([]*MRInfo, error) {
 // ListQueueAnomalies finds stale claims and orphaned branches in open MRs.
 // This gives Witness/Refinery patrols deterministic signals for deadlock risk.
 func (e *Engineer) ListQueueAnomalies(now time.Time) ([]*MRAnomaly, error) {
-	issues, err := e.beads.List(beads.ListOptions{
+	issues, err := e.beads.ListMergeRequests(beads.ListOptions{
 		Status:   "open",
 		Label:    "gt:merge-request",
 		Priority: -1,
