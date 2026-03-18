@@ -617,11 +617,17 @@ gt escalate -s CRITICAL "Dolt server is down"
 ```
 
 **Commit bloat (commits > 50k in any DB):**
-⚠️ DOG DISPATCH DISABLED (gs-413): Do NOT dispatch compactor dog. Instead,
-run compaction inline: `dolt --data-dir $GT_ROOT/.dolt-data sql --result-format csv -q "USE <db>; CALL dolt_gc();"`
+The compactor dog (`mol-dog-compactor`) may have failed. Dispatch a compactor:
+```bash
+gt dog dispatch --formula mol-dog-compactor --var db=<db_name>
+```
+If no idle dogs, log for next cycle.
 
 **Stale backups:**
-⚠️ DOG DISPATCH DISABLED (gs-413): Do NOT dispatch backup dog. Escalate to Mayor instead.
+The backup dog (`mol-dog-backup`) may have failed. Dispatch a backup:
+```bash
+gt dog dispatch --formula mol-dog-backup
+```
 
 **Zombie processes:**
 Log the PIDs. The zombie-scan step (next) handles polecat zombies;
@@ -730,32 +736,106 @@ id = "dog-pool-maintenance"
 title = "Maintain dog pool"
 needs = ["health-scan"]
 description = """
-⚠️ DOG DISPATCH DISABLED (gs-413): Dog dispatch mechanism is broken — deacon
-writes .dog.json but never delivers mail/hook instructions. Dogs spin up, find
-nothing, and flood the Mayor with escalations. SKIP this step entirely until
-gs-413 is resolved. Do NOT spawn, add, or dispatch dogs.
+Ensure dog pool has available workers for dispatch.
 
-**Exit criteria:** Step skipped (gs-413 open)."""
+**Step 1: Check dog pool status**
+```bash
+gt dog status
+# Shows idle/working counts
+```
+
+**Step 2: Ensure minimum idle dogs**
+If idle count is 0 and working count is at capacity, consider spawning:
+```bash
+# If no idle dogs available
+gt dog add <name>
+# Names: alpha, bravo, charlie, delta, etc.
+```
+
+**Step 3: Retire stale dogs (optional)**
+Dogs that have been idle for >24 hours can be removed to save resources:
+```bash
+gt dogs list --json
+# Check last_active in each entry; if idle > 24h: gt dog remove <name>
+```
+
+**Pool sizing guidelines:**
+- Minimum: 1 idle dog always available
+- Maximum: 4 dogs total (balance resources vs throughput)
+- Spawn on demand when pool is empty
+
+**Exit criteria:** Pool has at least 1 idle dog."""
 
 [[steps]]
 id = "dog-health-check"
 title = "Check for stuck dogs"
 needs = ["dog-pool-maintenance"]
 description = """
-⚠️ DOG DISPATCH DISABLED (gs-413): Skip this step — no dogs should be running.
-If any dog sessions exist, kill them (tmux -L gt kill-session -t hq-dog-<name>).
+Check for dogs that have been working too long (stuck).
 
-**Exit criteria:** Step skipped (gs-413 open). Any stray dog sessions killed."""
+Dogs dispatched via `gt dog dispatch --plugin` are marked as "working" with
+a work description like "plugin:rebuild-gt". If a dog hangs, crashes, or
+takes too long, it needs intervention.
+
+**Step 1: List working dogs**
+```bash
+gt dog list --json
+# Filter for state: "working"
+```
+
+**Step 2: Check work duration**
+For each working dog:
+```bash
+gt dog status <name> --json
+# Check: work_started_at, current_work
+```
+
+Compare against timeout:
+- If plugin has [execution] timeout in plugin.md, use that
+- Default timeout: 10 minutes for infrastructure tasks
+
+**Duration calculation:**
+```
+stuck_threshold = plugin_timeout or 10m
+duration = now - work_started_at
+is_stuck = duration > stuck_threshold
+```
+
+**Step 3: Handle stuck dogs**
+
+For dogs working > timeout:
+```bash
+# Option A: File death warrant (Boot handles termination)
+gt warrant file deacon/dogs/<name> --reason "Stuck: working on <work> for <duration>"
+
+# Option B: Force clear work and notify
+gt dog clear <name> --force
+gt mail send deacon/ -s "DOG_TIMEOUT <name>" -m "Dog <name> timed out on <work> after <duration>"
+```
+
+**Decision matrix:**
+
+| Duration over timeout | Action |
+|----------------------|--------|
+| < 2x timeout | Log warning, check next cycle |
+| 2x - 5x timeout | File death warrant |
+| > 5x timeout | Force clear + escalate to Mayor |
+
+**Step 4: Track chronic failures**
+If same dog gets stuck repeatedly:
+```bash
+gt mail send mayor/ -s "Dog <name> chronic failures" \
+  -m "Dog has timed out N times in last 24h. Consider removing from pool."
+```
+
+**Exit criteria:** All stuck dogs handled (warrant filed or cleared)."""
 
 [[steps]]
 id = "orphan-check"
 title = "Detect abandoned work"
 needs = ["dog-health-check"]
 description = """
-**DETECT ONLY** - Check for orphaned state. Log findings but do NOT dispatch dogs.
-
-⚠️ DOG DISPATCH DISABLED (gs-413): Do NOT sling to deacon/dogs.
-If orphans are detected, escalate to Mayor with the list.
+**DETECT ONLY** - Check for orphaned state and dispatch to dog if found.
 
 **Step 1: Quick orphan scan**
 ```bash
@@ -768,38 +848,54 @@ For each in_progress issue, check if assignee session exists:
 gt session status <rig>/<name> --json | jq -r '.running' | grep -q true && echo "alive" || echo "orphan"
 ```
 
-**Step 2: If orphans detected, escalate**
+**Step 2: If orphans detected, dispatch to dog**
 ```bash
-gt escalate -s MEDIUM "Orphans detected: <list>. Dog dispatch disabled (gs-413)."
+# Sling orphan-scan formula to an idle dog
+gt sling mol-orphan-scan deacon/dogs --var scope=town
 ```
 
-**Exit criteria:** Orphan scan complete, findings escalated if any."""
+**Important:** Do NOT fix orphans inline. Dogs handle recovery.
+The Deacon's job is detection and dispatch, not execution.
+
+**Step 3: If no orphans detected**
+Skip dispatch - nothing to do.
+
+**Exit criteria:** Orphan scan dispatched to dog (if needed)."""
 
 [[steps]]
 id = "session-gc"
 title = "Detect cleanup needs"
 needs = ["orphan-check"]
 description = """
-**DETECT ONLY** - Check if cleanup is needed. Log findings but do NOT dispatch dogs.
+**DETECT ONLY** - Check if cleanup is needed and dispatch to dog.
 
-⚠️ DOG DISPATCH DISABLED (gs-413): Do NOT sling to deacon/dogs.
-If cleanup is needed, escalate to Mayor.
-
-**Step 1: Preview cleanup needs**
+**Step 1: Quick cleanup check (avoid gt doctor -v — takes 60s, blocks patrol)**
 ```bash
-gt doctor -v
-# Check output for issues that need cleaning
+# Fast orphan session check only
+tmux list-sessions 2>/dev/null | wc -l
+# Count open wisps as a proxy for system load
+bd list --status=open --json 2>/dev/null | jq length
 ```
 
-**Step 2: If cleanup needed, escalate**
+**Step 2: If cleanup needed, dispatch to dog**
 ```bash
-gt escalate -s MEDIUM "Session cleanup needed: <summary>. Dog dispatch disabled (gs-413)."
+# Sling session-gc formula to an idle dog
+gt sling mol-session-gc deacon/dogs --var mode=conservative
 ```
+
+**Important:** Do NOT run `gt doctor -v` or `gt doctor --fix` inline.
+`gt doctor -v` takes 60+ seconds and blocks the patrol loop.
+Dogs handle cleanup. The Deacon stays lightweight - detection only.
 
 **Step 3: If nothing to clean**
-Skip - system is healthy.
+Skip dispatch - system is healthy.
 
-**Exit criteria:** Cleanup needs assessed, escalated if any."""
+**Cleanup types (for reference):**
+- orphan-sessions: Dead tmux sessions
+- orphan-processes: Orphaned Claude processes
+- wisp-gc: Old wisps past retention
+
+**Exit criteria:** Session GC dispatched to dog (if needed)."""
 
 [[steps]]
 id = "wisp-compact"

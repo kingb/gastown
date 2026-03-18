@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
@@ -129,6 +130,15 @@ func outputMayorContext(ctx RoleContext) {
 	fmt.Println("## Hookable Mail")
 	fmt.Println("Mail can be hooked for ad-hoc instructions: `" + cli.Name() + " hook attach <mail-id>`")
 	fmt.Println("If mail is on your hook, read and execute its instructions (GUPP applies).")
+	fmt.Println()
+	fmt.Println("## Lifecycle Nudges (SLOT_OPEN)")
+	fmt.Println("When you receive a SLOT_OPEN nudge from the Witness, a polecat has completed")
+	fmt.Println("work and its slot is available. **Always verify via CLI before deciding action:**")
+	fmt.Println()
+	fmt.Println("1. Run `" + cli.Name() + " polecat list` to get ground truth on polecat state")
+	fmt.Println("2. Do NOT trust your in-context belief about polecat state — it may be stale")
+	fmt.Println("3. If slots are open and beads are queued: `" + cli.Name() + " sling <bead> <rig>`")
+	fmt.Println("4. Witness lifecycle events are authoritative — never second-guess them")
 	fmt.Println()
 	fmt.Println("## Startup")
 	fmt.Println("Check for handoff messages with 🤝 HANDOFF in subject - continue predecessor's work.")
@@ -466,7 +476,9 @@ func outputStartupDirective(ctx RoleContext) {
 		fmt.Println("4. If there's a 🤝 HANDOFF message, read it and continue the work")
 		fmt.Println("5. Check for attached work: `" + cli.Name() + " hook`")
 		fmt.Println("   - If attachment found → **RUN IT** (no human input needed)")
-		fmt.Println("   - If no attachment → await user instruction")
+		fmt.Println("   - If no attachment → **STOP and wait for input**. Do NOT run")
+		fmt.Println("     any more commands. Do NOT poll mail. Do NOT check status.")
+		fmt.Println("     Sit idle at your prompt — a nudge or user message will arrive.")
 	case RoleDeacon:
 		// Skip startup protocol if paused - the pause message was already shown
 		paused, _, _ := deacon.IsPaused(ctx.TownRoot)
@@ -526,7 +538,7 @@ func outputAttachmentStatus(ctx RoleContext) {
 
 	// Check first pinned bead for attachment
 	attachment := beads.ParseAttachmentFields(pinnedBeads[0])
-	if attachment == nil || attachment.AttachedMolecule == "" {
+	if !hasWorkflowAttachment(attachment) {
 		// No attachment - interactive mode
 		return
 	}
@@ -535,9 +547,21 @@ func outputAttachmentStatus(ctx RoleContext) {
 	fmt.Println()
 	fmt.Printf("%s\n\n", style.Bold.Render("## 🎯 ATTACHED WORK DETECTED"))
 	fmt.Printf("Pinned bead: %s\n", pinnedBeads[0].ID)
-	fmt.Printf("Attached molecule: %s\n", attachment.AttachedMolecule)
+	if attachment.AttachedFormula != "" {
+		fmt.Printf("Attached formula: %s\n", attachment.AttachedFormula)
+	}
+	if attachment.AttachedMolecule != "" {
+		fmt.Printf("Attached molecule: %s\n", attachment.AttachedMolecule)
+	}
 	if attachment.AttachedAt != "" {
 		fmt.Printf("Attached at: %s\n", attachment.AttachedAt)
+	}
+	if len(attachment.AttachedVars) > 0 {
+		fmt.Println()
+		fmt.Printf("%s\n", style.Bold.Render("🧩 VARS (instantiated formula inputs):"))
+		for _, variable := range attachment.AttachedVars {
+			fmt.Printf("  --var %s\n", variable)
+		}
 	}
 	if attachment.AttachedArgs != "" {
 		fmt.Println()
@@ -548,7 +572,7 @@ func outputAttachmentStatus(ctx RoleContext) {
 
 	// Show inline formula steps if formula name is known, else fall back to bd mol current
 	if attachment.AttachedFormula != "" {
-		showFormulaStepsFull(attachment.AttachedFormula)
+		showFormulaStepsFull(attachment.AttachedFormula, strings.Split(attachment.FormulaVars, "\n"))
 	} else {
 		showMoleculeExecutionPrompt(ctx.WorkDir, attachment.AttachedMolecule)
 	}

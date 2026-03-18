@@ -62,9 +62,6 @@ func buildAgentBeadID(identity string, role Role, townRoot string) string {
 		case len(parts) == 3 && parts[1] == "polecats":
 			// rig/polecats/name - explicit polecat
 			return beads.PolecatBeadIDWithPrefix(getPrefix(parts[0]), parts[0], parts[2])
-		case len(parts) == 3 && parts[1] == "dogs":
-			// deacon/dogs/name - dog
-			return beads.DogBeadIDTown(parts[2])
 		default:
 			return ""
 		}
@@ -102,13 +99,6 @@ func buildAgentBeadID(identity string, role Role, townRoot string) string {
 	case RoleBoot:
 		// Boot is a deacon dog — uses town-level dog bead ID
 		return beads.DogBeadIDTown("boot")
-	case RoleDog:
-		// Dog uses town-level dog bead ID with dog name
-		// Identity format: deacon/dogs/name
-		if len(parts) >= 3 && parts[1] == "dogs" {
-			return beads.DogBeadIDTown(parts[2])
-		}
-		return ""
 	default:
 		return ""
 	}
@@ -136,8 +126,10 @@ type MoleculeStatusInfo struct {
 	HasWork          bool                  `json:"has_work"`
 	PinnedBead       *beads.Issue          `json:"pinned_bead,omitempty"`
 	AttachedMolecule string                `json:"attached_molecule,omitempty"`
+	AttachedFormula  string                `json:"attached_formula,omitempty"`
 	AttachedAt       string                `json:"attached_at,omitempty"`
 	AttachedArgs     string                `json:"attached_args,omitempty"`
+	AttachedVars     []string              `json:"attached_vars,omitempty"`
 	IsWisp           bool                  `json:"is_wisp"`
 	Progress         *MoleculeProgressInfo `json:"progress,omitempty"`
 	NextAction       string                `json:"next_action,omitempty"`
@@ -362,10 +354,28 @@ func runMoleculeStatus(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Find beads directory
+	// Find beads directory.
+	// First try CWD-based discovery, then resolve to the correct rig database
+	// based on the agent's identity. Without this, CWD at the town root (~/gt)
+	// queries the hq database instead of the rig's database where hooked beads
+	// actually live. See bd-hook-status-cwd-bug.
 	workDir, err := findLocalBeadsDir()
 	if err != nil {
 		return fmt.Errorf("not in a beads workspace: %w", err)
+	}
+
+	// Resolve to the agent's rig beads directory if CWD-based discovery
+	// found the wrong database. This matches runHookShow's resolution logic.
+	if !isTownLevelRole(target) && townRoot != "" {
+		agentBeadID := buildAgentBeadID(target, roleCtx.Role, townRoot)
+		if agentBeadID != "" {
+			rigName := strings.Split(target, "/")[0]
+			fallbackPath := filepath.Join(townRoot, rigName)
+			resolvedDir := beads.ResolveHookDir(townRoot, agentBeadID, fallbackPath)
+			if resolvedDir != "" {
+				workDir = resolvedDir
+			}
+		}
 	}
 
 	b := beads.New(workDir)
@@ -379,41 +389,23 @@ func runMoleculeStatus(cmd *cobra.Command, args []string) error {
 	// lookupHookedWork performs the full multi-step hook lookup for target.
 	// Called in a retry loop for polecats to handle Dolt propagation lag.
 	lookupHookedWork := func() *beads.Issue {
+		// Resolve agent bead ID for display purposes only.
+		// Agent bead's hook_bead field is no longer maintained (updateAgentHookBead is
+		// a no-op since hq-l6mm5), so reading it returns stale data. See GH#2371.
 		agentBeadID := buildAgentBeadID(target, roleCtx.Role, townRoot)
-
 		if agentBeadID != "" {
-			// Resolve the correct beads directory for the agent bead using prefix-based
-			// routing. This matches how updateAgentHookBead resolves the directory when
-			// setting the hook (via beads.ResolveHookDir).
 			agentBeadPath := beads.ResolveHookDir(townRoot, agentBeadID, workDir)
 			agentB := b
 			if agentBeadPath != workDir {
 				agentB = beads.New(agentBeadPath)
 			}
-
 			agentBead, err := agentB.Show(agentBeadID)
 			if err == nil && beads.IsAgentBead(agentBead) {
 				status.AgentBeadID = agentBeadID
-
-				// Read hook_bead from the agent bead's database field (not description!)
-				// The hook_bead column is updated by `bd slot set` in UpdateAgentState.
-				// IMPORTANT: Don't use ParseAgentFields on description - the description
-				// field may contain stale data, causing the wrong issue to be hooked.
-				if agentBead.HookBead != "" {
-					hookBeadPath := beads.ResolveHookDir(townRoot, agentBead.HookBead, workDir)
-					hookB := b
-					if hookBeadPath != workDir {
-						hookB = beads.New(hookBeadPath)
-					}
-					hookBead, err := hookB.Show(agentBead.HookBead)
-					if err == nil {
-						return hookBead
-					}
-				}
 			}
 		}
 
-		// FALLBACK: Query for hooked beads (work on agent's hook)
+		// Query for hooked beads using the authoritative source: bead status + assignee.
 		// First try status=hooked (work that's been slung but not yet claimed)
 		hookedBeads, err := b.List(beads.ListOptions{
 			Status:   beads.StatusHooked,
@@ -500,14 +492,20 @@ func runMoleculeStatus(cmd *cobra.Command, args []string) error {
 		attachment := beads.ParseAttachmentFields(hookBead)
 		if attachment != nil {
 			status.AttachedMolecule = attachment.AttachedMolecule
+			status.AttachedFormula = attachment.AttachedFormula
 			status.AttachedAt = attachment.AttachedAt
 			status.AttachedArgs = attachment.AttachedArgs
+			status.AttachedVars = attachment.AttachedVars
 
 			status.IsWisp = strings.Contains(hookBead.Description, "wisp: true") ||
 				strings.Contains(hookBead.Description, "is_wisp: true")
 
 			if attachment.AttachedMolecule != "" {
 				progress, _ := getMoleculeProgressInfo(b, attachment.AttachedMolecule)
+				status.Progress = progress
+				status.NextAction = determineNextAction(status)
+			} else if attachment.AttachedFormula != "" {
+				progress, _ := getMoleculeProgressInfo(b, hookBead.ID)
 				status.Progress = progress
 				status.NextAction = determineNextAction(status)
 			}
@@ -517,8 +515,10 @@ func runMoleculeStatus(cmd *cobra.Command, args []string) error {
 	// Determine next action if no work is slung
 	if !status.HasWork {
 		status.NextAction = "Check inbox for work assignments: gt mail inbox"
-	} else if status.AttachedMolecule == "" {
+	} else if status.AttachedMolecule == "" && status.AttachedFormula == "" {
 		status.NextAction = "Attach a molecule to start work: gt mol attach <bead-id> <molecule-id>"
+	} else if status.AttachedFormula != "" && status.NextAction == "" && status.PinnedBead != nil {
+		status.NextAction = "Show the workflow steps: gt prime or bd mol current " + status.PinnedBead.ID
 	}
 
 	// JSON output
@@ -561,6 +561,9 @@ func buildAgentIdentity(ctx RoleContext) string {
 	case RoleCrew:
 		return ctx.Rig + "/crew/" + ctx.Polecat
 	case RoleDog:
+		if ctx.Polecat == "" {
+			return ""
+		}
 		return "deacon/dogs/" + ctx.Polecat
 	default:
 		return ""
@@ -750,7 +753,18 @@ func outputMoleculeStatus(status MoleculeStatusInfo) error {
 	}
 
 	fmt.Printf("%s %s: %s\n", style.Bold.Render("🪝 Hooked:"), status.PinnedBead.ID, status.PinnedBead.Title)
-
+	if status.AttachedFormula != "" {
+		fmt.Printf("%s %s\n", style.Bold.Render("📐 Formula:"), status.AttachedFormula)
+	}
+	if len(status.AttachedVars) > 0 {
+		fmt.Printf("%s\n", style.Bold.Render("🧩 Vars:"))
+		for _, variable := range status.AttachedVars {
+			fmt.Printf("   --var %s\n", variable)
+		}
+	}
+	if status.AttachedArgs != "" {
+		fmt.Printf("%s %s\n", style.Bold.Render("📋 Args:"), status.AttachedArgs)
+	}
 	// Show attached molecule
 	if status.AttachedMolecule != "" {
 		molType := "Molecule"
@@ -761,10 +775,7 @@ func outputMoleculeStatus(status MoleculeStatusInfo) error {
 		if status.AttachedAt != "" {
 			fmt.Printf("   Attached: %s\n", status.AttachedAt)
 		}
-		if status.AttachedArgs != "" {
-			fmt.Printf("   %s %s\n", style.Bold.Render("Args:"), status.AttachedArgs)
-		}
-	} else {
+	} else if status.AttachedFormula == "" {
 		fmt.Printf("%s\n", style.Dim.Render("No molecule attached (hooked bead still triggers autonomous work)"))
 	}
 

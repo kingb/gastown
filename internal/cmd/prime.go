@@ -29,6 +29,7 @@ var primeDryRun bool
 var primeState bool
 var primeStateJSON bool
 var primeExplain bool
+var primeStructuredSessionStartOutput bool
 
 // primeHookSource stores the SessionStart source ("startup", "resume", "clear", "compact")
 // when running in hook mode. Used to provide lighter output on compaction/resume.
@@ -70,16 +71,26 @@ Role detection:
 This command is typically used in shell prompts or agent initialization.
 
 HOOK MODE (--hook):
-  When called as an LLM runtime hook, use --hook to enable session ID handling.
-  This reads session metadata from stdin and persists it for the session.
+  When called as an LLM runtime hook, use --hook to enable session ID handling,
+  agent-ready signaling, and session persistence.
+
+  Session ID resolution (first match wins):
+    1. GT_SESSION_ID env var
+    2. CLAUDE_SESSION_ID env var
+    3. Persisted .runtime/session_id (from prior SessionStart)
+    4. Stdin JSON (Claude Code format)
+    5. Auto-generated UUID
+
+  Source resolution: GT_HOOK_SOURCE env var, then stdin JSON "source" field.
 
   Claude Code integration (in .claude/settings.json):
     "SessionStart": [{"hooks": [{"type": "command", "command": "gt prime --hook"}]}]
+    Claude sends JSON on stdin: {"session_id":"uuid","source":"startup|resume|compact"}
 
-  Claude Code sends JSON on stdin:
-    {"session_id": "uuid", "transcript_path": "/path", "source": "startup|resume"}
-
-  Other agents can set GT_SESSION_ID environment variable instead.`,
+  Gemini CLI / other runtimes (in .gemini/settings.json):
+    "SessionStart": "export GT_SESSION_ID=$(uuidgen) GT_HOOK_SOURCE=startup && gt prime --hook"
+    "PreCompress":  "export GT_HOOK_SOURCE=compact && gt prime --hook"
+    Set GT_SESSION_ID + GT_HOOK_SOURCE as env vars to skip the stdin read entirely.`,
 	RunE: runPrime,
 }
 
@@ -147,6 +158,16 @@ func runPrime(cmd *cobra.Command, args []string) (retErr error) {
 		return nil
 	}
 
+	// Compact/resume: fast path that skips setupPrimeSession and the
+	// retry-heavy findAgentWork. The agent already has role context and
+	// work state in compressed memory — just confirm identity and inject
+	// any new mail. This keeps PreCompress hooks under 1s for non-Claude
+	// runtimes that have short hook timeouts (Gemini CLI).
+	if isCompactResume() {
+		runPrimeCompactResume(ctx)
+		return nil
+	}
+
 	if err := setupPrimeSession(ctx, roleInfo); err != nil {
 		return err
 	}
@@ -155,16 +176,18 @@ func runPrime(cmd *cobra.Command, args []string) (retErr error) {
 	// injectWorkContext sets GT_WORK_RIG/BEAD/MOL in the current process env and
 	// in the tmux session env so all subsequent subprocesses (bd, mail, …) carry
 	// the correct work attribution until the next gt prime overwrites it.
-	hookedBead := findAgentWork(ctx)
-	injectWorkContext(ctx, hookedBead)
-
-	// Compact/resume: lighter prime that skips verbose role context.
-	// The agent already has role docs in compressed memory — just restore
-	// identity, hook status, and any new mail.
-	if isCompactResume() {
-		runPrimeCompactResume(ctx, cwd, hookedBead)
-		return nil
+	hookedBead, hookErr := findAgentWork(ctx)
+	if hookErr != nil {
+		// Database error during hook query — NOT the same as "no work assigned".
+		// Emit a loud warning so the agent does NOT run gt done / close the bead.
+		// This prevents the destructive cycle: DB error → "no work" → gt done → bead lost. (GH#2638)
+		fmt.Fprintf(os.Stderr, "\n%s\n", style.Bold.Render("## ⚠️  DATABASE ERROR — DO NOT RUN gt done ⚠️"))
+		fmt.Fprintf(os.Stderr, "Hook query failed: %v\n", hookErr)
+		fmt.Fprintf(os.Stderr, "This is a database connectivity error, NOT an empty hook.\n")
+		fmt.Fprintf(os.Stderr, "Your work may still be assigned. Do NOT close any beads.\n")
+		fmt.Fprintf(os.Stderr, "Escalate to witness/mayor and wait for resolution.\n\n")
 	}
+	injectWorkContext(ctx, hookedBead)
 
 	formula, err := outputRoleContext(ctx)
 	if err != nil {
@@ -196,15 +219,14 @@ func runPrime(cmd *cobra.Command, args []string) (retErr error) {
 
 // runPrimeCompactResume runs a lighter prime after compaction or resume.
 // The agent already has full role context in compressed memory. This just
-// restores identity, checks hook/work status, and injects any new mail.
+// restores identity and injects any new mail. It deliberately skips
+// setupPrimeSession and findAgentWork (which hit Dolt) to stay fast
+// enough for non-Claude runtimes with short hook timeouts.
 //
-// Unlike the full prime path, this uses a continuation directive instead of
+// Unlike the full prime path, this outputs a brief recovery line instead of
 // the full AUTONOMOUS WORK MODE block. This prevents agents from re-announcing
 // and re-initializing after compaction. (GH#1965)
-//
-// hookedBead is pre-fetched by the caller (runPrime) to avoid a redundant
-// findAgentWork call and ensure work context is injected before this runs.
-func runPrimeCompactResume(ctx RoleContext, cwd string, hookedBead *beads.Issue) {
+func runPrimeCompactResume(ctx RoleContext) {
 	// Brief identity confirmation
 	actor := getAgentIdentity(ctx)
 	source := primeHookSource
@@ -217,26 +239,9 @@ func runPrimeCompactResume(ctx RoleContext, cwd string, hookedBead *beads.Issue)
 	// Session metadata for seance
 	outputSessionMetadata(ctx)
 
-	// Output continuation directive (not full autonomous startup).
-	// The agent already knows what it was doing — just remind it of the hook.
-	if hookedBead != nil {
-		attachment := beads.ParseAttachmentFields(hookedBead)
-		hasMolecule := attachment != nil && attachment.AttachedMolecule != ""
-		outputContinuationDirective(hookedBead, hasMolecule)
-	}
-
-	// Molecule progress if available
-	outputMoleculeContext(ctx)
-
-	// Inject any mail that arrived during compaction
-	if !primeDryRun {
-		runMailCheckInject(cwd)
-	}
-
-	// Startup directive only if no hooked work
-	if hookedBead == nil {
-		outputStartupDirective(ctx)
-	}
+	fmt.Println("\n---")
+	fmt.Println()
+	fmt.Println("**Continue your current task.** If you've lost context, run `gt prime` for full reload.")
 }
 
 // validatePrimeFlags checks that CLI flag combinations are valid.
@@ -298,10 +303,24 @@ func handlePrimeHookMode(townRoot, cwd string) {
 	primeHookSource = source
 
 	explain(true, "Session beacon: hook mode enabled, session ID from stdin")
-	fmt.Printf("[session:%s]\n", sessionID)
-	if source != "" {
-		fmt.Printf("[source:%s]\n", source)
+	for _, line := range hookSessionBeaconLines(sessionID, source) {
+		fmt.Println(line)
 	}
+}
+
+// hookSessionBeaconLines returns the bracketed session/source markers used by
+// the normal hook path. Structured SessionStart output skips them because Codex
+// tries to auto-detect JSON, sees the leading '[', and misclassifies the startup
+// stream as JSON instead of plain text metadata.
+func hookSessionBeaconLines(sessionID, source string) []string {
+	if primeStructuredSessionStartOutput {
+		return nil
+	}
+	lines := []string{fmt.Sprintf("[session:%s]", sessionID)}
+	if source != "" {
+		lines = append(lines, fmt.Sprintf("[source:%s]", source))
+	}
+	return lines
 }
 
 // signalAgentReady sets GT_AGENT_READY=1 in the current tmux session environment.
@@ -429,34 +448,65 @@ func runBdPrime(workDir string) {
 	}
 }
 
+// memoryTypeLabels maps type keys to human-readable section headers for prime injection.
+var memoryTypeLabels = map[string]string{
+	"feedback":  "Behavioral Rules (from user feedback)",
+	"user":      "User Context",
+	"project":   "Project Context",
+	"reference":  "Reference Links",
+	"general":   "General",
+}
+
 // runMemoryInject loads memories from beads kv and outputs them during prime.
-// This replaces MEMORY.md injection with bead-backed agent memory.
+// Memories are grouped by type and ordered by priority (feedback first).
 func runMemoryInject() {
 	kvs, err := bdKvListJSON()
 	if err != nil {
 		return // Silently skip if kv list fails
 	}
 
-	var memories []string
+	// Group memories by type
+	type mem struct {
+		shortKey string
+		value    string
+	}
+	grouped := make(map[string][]mem)
+
 	for k, v := range kvs {
 		if !strings.HasPrefix(k, memoryKeyPrefix) {
 			continue
 		}
-		shortKey := strings.TrimPrefix(k, memoryKeyPrefix)
-		memories = append(memories, fmt.Sprintf("- **%s**: %s", shortKey, v))
+		memType, shortKey := parseMemoryKey(k)
+		grouped[memType] = append(grouped[memType], mem{shortKey: shortKey, value: v})
 	}
 
-	if len(memories) == 0 {
+	if len(grouped) == 0 {
 		return
 	}
 
-	sort.Strings(memories)
+	// Sort each group by key
+	for t := range grouped {
+		sort.Slice(grouped[t], func(i, j int) bool {
+			return grouped[t][i].shortKey < grouped[t][j].shortKey
+		})
+	}
 
 	fmt.Println()
 	fmt.Println("# Agent Memories")
-	fmt.Println()
-	for _, m := range memories {
-		fmt.Println(m)
+
+	for _, t := range memoryTypeOrder {
+		mems, ok := grouped[t]
+		if !ok || len(mems) == 0 {
+			continue
+		}
+		label := memoryTypeLabels[t]
+		if label == "" {
+			label = t
+		}
+		fmt.Printf("\n## %s\n\n", label)
+		for _, m := range mems {
+			fmt.Printf("- **%s**: %s\n", m.shortKey, m.value)
+		}
 	}
 }
 
@@ -497,12 +547,12 @@ func checkSlungWork(ctx RoleContext, hookedBead *beads.Issue) bool {
 	}
 
 	attachment := beads.ParseAttachmentFields(hookedBead)
-	hasMolecule := attachment != nil && attachment.AttachedMolecule != ""
+	hasWorkflow := hasWorkflowAttachment(attachment)
 
-	outputAutonomousDirective(ctx, hookedBead, hasMolecule)
+	outputAutonomousDirective(ctx, hookedBead, hasWorkflow)
 	outputHookedBeadDetails(hookedBead)
 
-	if hasMolecule {
+	if hasWorkflow {
 		outputMoleculeWorkflow(ctx, attachment)
 	} else {
 		outputBeadPreview(hookedBead)
@@ -511,17 +561,24 @@ func checkSlungWork(ctx RoleContext, hookedBead *beads.Issue) bool {
 	return true
 }
 
+func hasWorkflowAttachment(attachment *beads.AttachmentFields) bool {
+	return attachment != nil && (attachment.AttachedMolecule != "" || attachment.AttachedFormula != "")
+}
+
 // findAgentWork looks up hooked or in-progress beads assigned to this agent.
 // Primary: reads hook_bead from the agent bead (same strategy as detectSessionState/gt hook).
 // Fallback: queries by assignee for agents without an agent bead.
 // For polecats and crew, retries up to 3 times with 2-second delays to handle
 // the timing race where hook state hasn't propagated by the time gt prime runs.
 // See: https://github.com/steveyegge/gastown/issues/1438
-// Returns nil if no work is found.
-func findAgentWork(ctx RoleContext) *beads.Issue {
+//
+// Returns (nil, nil) if no work is found.
+// Returns (nil, err) if all attempts failed due to database errors — the caller
+// MUST distinguish this from "no work" to avoid silently closing beads. (GH#2638)
+func findAgentWork(ctx RoleContext) (*beads.Issue, error) {
 	agentID := getAgentIdentity(ctx)
 	if agentID == "" {
-		return nil
+		return nil, nil
 	}
 
 	// Polecats and crew use a retry loop to handle the timing race where
@@ -529,11 +586,16 @@ func findAgentWork(ctx RoleContext) *beads.Issue {
 	// Dolt connections by the time gt prime runs on session startup.
 	// Uses exponential backoff: 500ms, 1s, 2s, 4s, 8s (total ~15.5s max).
 	// See: https://github.com/steveyegge/gastown/issues/2389
+	//
+	// On compact/resume, the agent already has work context in memory.
+	// A single attempt suffices — retries would add ~15s of latency to
+	// compaction hooks, causing non-Claude runtimes to report hook failure.
 	maxAttempts := 1
-	if ctx.Role == RolePolecat || ctx.Role == RoleCrew {
+	if (ctx.Role == RolePolecat || ctx.Role == RoleCrew) && !isCompactResume() {
 		maxAttempts = 5
 	}
 
+	var lastErr error
 	backoff := 500 * time.Millisecond
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		if attempt > 1 {
@@ -541,16 +603,26 @@ func findAgentWork(ctx RoleContext) *beads.Issue {
 			backoff *= 2
 		}
 
-		if result := findAgentWorkOnce(ctx, agentID); result != nil {
-			return result
+		result, err := findAgentWorkOnce(ctx, agentID)
+		if result != nil {
+			return result, nil
+		}
+		if err != nil {
+			lastErr = err
+		} else {
+			// Successful query returned no work — not a DB error
+			lastErr = nil
 		}
 	}
 
-	return nil
+	return nil, lastErr
 }
 
 // findAgentWorkOnce performs a single attempt to find hooked work for an agent.
-func findAgentWorkOnce(ctx RoleContext, agentID string) *beads.Issue {
+// Returns (nil, nil) when no work is found.
+// Returns (nil, err) when the database query itself failed — the caller must
+// not treat this as "no work assigned". (GH#2638)
+func findAgentWorkOnce(ctx RoleContext, agentID string) (*beads.Issue, error) {
 	// Use rig root for beads queries instead of ctx.WorkDir. Polecat worktrees
 	// rely on .beads/redirect which can fail to resolve in edge cases, causing
 	// polecats to miss hooked work and exit immediately. The rig root directory
@@ -569,7 +641,7 @@ func findAgentWorkOnce(ctx RoleContext, agentID string) *beads.Issue {
 			hb := beads.New(hookBeadDir)
 			if hookBead, err := hb.Show(agentBead.HookBead); err == nil && hookBead != nil &&
 				(hookBead.Status == beads.StatusHooked || hookBead.Status == "in_progress") {
-				return hookBead
+				return hookBead, nil
 			}
 		}
 	}
@@ -581,7 +653,7 @@ func findAgentWorkOnce(ctx RoleContext, agentID string) *beads.Issue {
 		Priority: -1,
 	})
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("querying hooked beads: %w", err)
 	}
 
 	// Fall back to in_progress beads (session interrupted before completion)
@@ -591,7 +663,10 @@ func findAgentWorkOnce(ctx RoleContext, agentID string) *beads.Issue {
 			Assignee: agentID,
 			Priority: -1,
 		})
-		if err == nil && len(inProgressBeads) > 0 {
+		if err != nil {
+			return nil, fmt.Errorf("querying in-progress beads: %w", err)
+		}
+		if len(inProgressBeads) > 0 {
 			hookedBeads = inProgressBeads
 		}
 	}
@@ -614,12 +689,13 @@ func findAgentWorkOnce(ctx RoleContext, agentID string) *beads.Issue {
 		}); err == nil && len(townIP) > 0 {
 			hookedBeads = townIP
 		}
+		// Town-level fallback errors are non-fatal — rig-level query succeeded
 	}
 
 	if len(hookedBeads) == 0 {
-		return nil
+		return nil, nil
 	}
-	return hookedBeads[0]
+	return hookedBeads[0], nil
 }
 
 // rigBeadsRoot returns the directory to use for beads queries.
@@ -703,6 +779,12 @@ func outputMoleculeWorkflow(ctx RoleContext, attachment *beads.AttachmentFields)
 	if attachment.AttachedMolecule != "" {
 		fmt.Printf("Molecule ID: %s\n", attachment.AttachedMolecule)
 	}
+	if len(attachment.AttachedVars) > 0 {
+		fmt.Printf("\n%s\n", style.Bold.Render("🧩 VARS (instantiated formula inputs):"))
+		for _, variable := range attachment.AttachedVars {
+			fmt.Printf("  --var %s\n", variable)
+		}
+	}
 	if attachment.AttachedArgs != "" {
 		fmt.Printf("\n%s\n", style.Bold.Render("📋 ARGS (use these to guide execution):"))
 		fmt.Printf("  %s\n", attachment.AttachedArgs)
@@ -717,7 +799,7 @@ func outputMoleculeWorkflow(ctx RoleContext, attachment *beads.AttachmentFields)
 
 	// Show inline formula steps from the embedded binary (root-only: no child wisps to query).
 	if attachment.AttachedFormula != "" {
-		showFormulaStepsFull(attachment.AttachedFormula)
+		showFormulaStepsFull(attachment.AttachedFormula, strings.Split(attachment.FormulaVars, "\n"))
 		fmt.Println()
 		fmt.Printf("%s\n", style.Bold.Render("Work through the checklist above. When all steps complete, run `"+cli.Name()+" done`."))
 		fmt.Println("The base bead is your assignment. The formula steps define your workflow.")
@@ -760,6 +842,9 @@ func outputRalphLoopDirective(_ RoleContext, attachment *beads.AttachmentFields)
 func buildRalphPromptFromMolecule(attachment *beads.AttachmentFields) string {
 	var b strings.Builder
 	b.WriteString("Execute the attached molecule workflow. ")
+	if len(attachment.AttachedVars) > 0 {
+		b.WriteString("Formula vars: " + strings.Join(attachment.AttachedVars, ", ") + ". ")
+	}
 	if attachment.AttachedArgs != "" {
 		b.WriteString("Context: " + attachment.AttachedArgs + ". ")
 	}
