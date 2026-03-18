@@ -189,11 +189,12 @@ func runDoltRebase(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  Rebase plan: %d commits\n", totalPlan)
 
 	// Calculate how many to squash: everything except first (must stay pick) and last N.
-	var minOrder, maxOrder int
-	if err := db.QueryRowContext(ctx, "SELECT MIN(rebase_order), MAX(rebase_order) FROM dolt_rebase").Scan(&minOrder, &maxOrder); err != nil {
+	var minOrderF, maxOrderF float64
+	if err := db.QueryRowContext(ctx, "SELECT MIN(rebase_order), MAX(rebase_order) FROM dolt_rebase").Scan(&minOrderF, &maxOrderF); err != nil {
 		rebaseAbortAndCleanup(db, baseBranch, workBranch)
 		return fmt.Errorf("getting rebase order range: %w", err)
 	}
+	minOrder, maxOrder := int(minOrderF), int(maxOrderF)
 
 	squashThreshold := maxOrder - doltRebaseKeepRecent
 	toSquash := 0
@@ -221,11 +222,12 @@ func runDoltRebase(cmd *cobra.Command, args []string) error {
 		defer rows.Close()
 
 		for rows.Next() {
-			var order int
+			var orderF float64
 			var action, hash, msg string
-			if err := rows.Scan(&order, &action, &hash, &msg); err != nil {
+			if err := rows.Scan(&orderF, &action, &hash, &msg); err != nil {
 				continue
 			}
+			order := int(orderF)
 			marker := "pick"
 			if order > minOrder && order <= squashThreshold {
 				marker = "squash"
