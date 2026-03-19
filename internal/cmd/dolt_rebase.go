@@ -280,9 +280,14 @@ func runDoltRebase(cmd *cobra.Command, args []string) error {
 		for table, preCount := range preCounts {
 			postCount, ok := postCounts[table]
 			if !ok {
-				// Abort — don't swap branches with missing tables.
+				if preCount == 0 {
+					// Dolt may drop empty tables during squash — this is safe.
+					fmt.Printf("  Note: empty table %q pruned during rebase (expected)\n", table)
+					continue
+				}
+				// Abort — don't swap branches with missing tables that had data.
 				rebaseCleanupAll(db, baseBranch, workBranch)
-				return fmt.Errorf("integrity FAIL: table %q missing after rebase", table)
+				return fmt.Errorf("integrity FAIL: table %q missing after rebase (had %d rows)", table, preCount)
 			}
 			if preCount != postCount {
 				rebaseCleanupAll(db, baseBranch, workBranch)
