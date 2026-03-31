@@ -1,2 +1,4 @@
-{"actor":"Brandon King","comment":null,"created_at":"2026-03-10T19:25:13Z","event_type":"created","id":1,"issue_id":"shep-rig-shepherd","new_value":"","old_value":""}
-{"actor":"Brandon King","comment":"Added label: gt:rig","created_at":"2026-03-10T19:25:13Z","event_type":"label_added","id":2,"issue_id":"shep-rig-shepherd","new_value":null,"old_value":null}
+{"actor":"mayor","comment":null,"created_at":"2026-03-15T23:54:16Z","event_type":"created","id":1,"issue_id":"shep-rig-shepherd","new_value":"","old_value":""}
+{"actor":"mayor","comment":"Added label: gt:rig","created_at":"2026-03-15T23:54:16Z","event_type":"label_added","id":2,"issue_id":"shep-rig-shepherd","new_value":null,"old_value":null}
+{"actor":"mayor","comment":"Added label: status:docked","created_at":"2026-03-16T00:16:26Z","event_type":"label_added","id":3,"issue_id":"shep-rig-shepherd","new_value":null,"old_value":null}
+{"actor":"shepherd/crew/book","comment":"Removed label: status:docked","created_at":"2026-03-18T23:56:01Z","event_type":"label_removed","id":4,"issue_id":"shep-rig-shepherd","new_value":null,"old_value":null}
