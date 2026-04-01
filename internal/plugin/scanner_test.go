@@ -429,6 +429,9 @@ func TestParsePluginMD_StuckAgentDogUsesCanonicalHeartbeatPath(t *testing.T) {
 	if !strings.Contains(plugin.Instructions, "$TOWN_ROOT/mayor/rigs.json") {
 		t.Fatalf("expected mayor/ fallback in instructions, got:\n%s", plugin.Instructions)
 	}
+	if !strings.Contains(plugin.Instructions, "Filter out any malformed/blank rows") {
+		t.Fatalf("expected fail-safe blank/malformed rigs row handling in instructions, got:\n%s", plugin.Instructions)
+	}
 	if !strings.Contains(plugin.Instructions, "could not parse rigs.json") {
 		t.Fatalf("expected fail-safe rigs.json parse handling in instructions, got:\n%s", plugin.Instructions)
 	}

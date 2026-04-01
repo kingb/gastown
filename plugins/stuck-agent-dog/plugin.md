@@ -85,6 +85,9 @@ if ! RIG_PREFIX_MAP=$(jq -r '
   echo "SKIP: could not parse rigs.json"
   exit 0
 fi
+
+# Filter out any malformed/blank rows so partial registry state fails safe.
+RIG_PREFIX_MAP=$(printf '%s\n' "$RIG_PREFIX_MAP" | awk -F'|' 'NF >= 2 && $1 != "" && $2 != ""')
 if [ -z "$RIG_PREFIX_MAP" ]; then
   echo "SKIP: no rigs found in rigs.json"
   exit 0
