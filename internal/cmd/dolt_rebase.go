@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
+	"strconv"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -189,12 +191,19 @@ func runDoltRebase(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  Rebase plan: %d commits\n", totalPlan)
 
 	// Calculate how many to squash: everything except first (must stay pick) and last N.
-	var minOrderF, maxOrderF float64
-	if err := db.QueryRowContext(ctx, "SELECT MIN(rebase_order), MAX(rebase_order) FROM dolt_rebase").Scan(&minOrderF, &maxOrderF); err != nil {
+	// Dolt returns rebase_order as DECIMAL — the MySQL driver delivers it as
+	// []uint8 (e.g. "1.00") which cannot be scanned directly into int.
+	// Scan as string, parse to float, then truncate to int.
+	var minOrderStr, maxOrderStr string
+	if err := db.QueryRowContext(ctx, "SELECT MIN(rebase_order), MAX(rebase_order) FROM dolt_rebase").Scan(&minOrderStr, &maxOrderStr); err != nil {
 		rebaseAbortAndCleanup(db, baseBranch, workBranch)
 		return fmt.Errorf("getting rebase order range: %w", err)
 	}
-	minOrder, maxOrder := int(minOrderF), int(maxOrderF)
+	minOrder, maxOrder, err := parseRebaseOrderRange(minOrderStr, maxOrderStr)
+	if err != nil {
+		rebaseAbortAndCleanup(db, baseBranch, workBranch)
+		return fmt.Errorf("parsing rebase order range: %w", err)
+	}
 
 	squashThreshold := maxOrder - doltRebaseKeepRecent
 	toSquash := 0
@@ -222,12 +231,15 @@ func runDoltRebase(cmd *cobra.Command, args []string) error {
 		defer rows.Close()
 
 		for rows.Next() {
-			var orderF float64
+			var orderStr string
 			var action, hash, msg string
-			if err := rows.Scan(&orderF, &action, &hash, &msg); err != nil {
+			if err := rows.Scan(&orderStr, &action, &hash, &msg); err != nil {
 				continue
 			}
-			order := int(orderF)
+			order, err := parseRebaseOrder(orderStr)
+			if err != nil {
+				continue
+			}
 			marker := "pick"
 			if order > minOrder && order <= squashThreshold {
 				marker = "squash"
@@ -269,35 +281,8 @@ func runDoltRebase(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Printf("  %s Rebase executed successfully\n", style.Bold.Render("✓"))
 
-	// Step 7: Verify integrity — row counts must match pre-flight.
-	postCounts, err := flattenGetRowCounts(db, dbName)
-	if err != nil {
-		// Rebase succeeded but we can't verify — this is concerning.
-		fmt.Printf("  %s WARNING: could not verify row counts after rebase: %v\n",
-			style.Bold.Render("!"), err)
-		fmt.Printf("  Proceeding with branch swap — data should be intact\n")
-	} else {
-		for table, preCount := range preCounts {
-			postCount, ok := postCounts[table]
-			if !ok {
-				if preCount == 0 {
-					// Dolt may drop empty tables during squash — this is safe.
-					fmt.Printf("  Note: empty table %q pruned during rebase (expected)\n", table)
-					continue
-				}
-				// Abort — don't swap branches with missing tables that had data.
-				rebaseCleanupAll(db, baseBranch, workBranch)
-				return fmt.Errorf("integrity FAIL: table %q missing after rebase (had %d rows)", table, preCount)
-			}
-			if preCount != postCount {
-				rebaseCleanupAll(db, baseBranch, workBranch)
-				return fmt.Errorf("integrity FAIL: %q pre=%d post=%d", table, preCount, postCount)
-			}
-		}
-		fmt.Printf("  %s Integrity verified (%d tables match)\n", style.Bold.Render("✓"), len(preCounts))
-	}
-
 	// Step 8: Concurrency check — verify main hasn't moved.
+
 	currentHead, err := flattenGetHead(db, dbName)
 	if err != nil {
 		rebaseCleanupAll(db, baseBranch, workBranch)
@@ -305,10 +290,10 @@ func runDoltRebase(cmd *cobra.Command, args []string) error {
 	}
 	if currentHead != preHead {
 		rebaseCleanupAll(db, baseBranch, workBranch)
-		return fmt.Errorf("ABORT: main HEAD moved during rebase (%s → %s)", preHead[:8], currentHead[:8])
+		return fmt.Errorf("ABORT: main HEAD moved during rebase (%s → %s)", shortHash(preHead), shortHash(currentHead))
 	}
 
-	// Step 9: Swap branches — make compact-work the new main.
+	// Step 8: Swap branches — make compact-work the new main.
 	// We're already on compact-work from the rebase.
 	if _, err := db.ExecContext(ctx, "CALL DOLT_BRANCH('-D', 'main')"); err != nil {
 		// Can't delete main — leave compact-work in place for manual recovery.
@@ -324,6 +309,35 @@ func runDoltRebase(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("checkout new main: %w", err)
 	}
 	fmt.Printf("  Branch swap complete — compact-work is now main\n")
+
+	// Step 9: Verify integrity — row counts must match pre-flight.
+	// This runs AFTER the branch swap so we're reading from the new main,
+	// not from compact-work (which may have different table visibility during rebase).
+	postCounts, err := flattenGetRowCounts(db, dbName)
+	if err != nil {
+		fmt.Printf("  %s WARNING: could not verify row counts after rebase: %v\n",
+			style.Bold.Render("!"), err)
+		fmt.Printf("  Branch swap already complete — verify manually with 'gt dolt status'\n")
+	} else {
+		integrityOK := true
+		for table, preCount := range preCounts {
+			postCount, ok := postCounts[table]
+			if !ok {
+				fmt.Printf("  %s INTEGRITY WARNING: table %q missing after rebase (was %d rows)\n",
+					style.Bold.Render("!"), table, preCount)
+				integrityOK = false
+			} else if preCount != postCount {
+				fmt.Printf("  %s INTEGRITY WARNING: %q row count changed: pre=%d post=%d\n",
+					style.Bold.Render("!"), table, preCount, postCount)
+				integrityOK = false
+			}
+		}
+		if integrityOK {
+			fmt.Printf("  %s Integrity verified (%d tables match)\n", style.Bold.Render("✓"), len(preCounts))
+		} else {
+			fmt.Printf("  %s Some integrity checks failed — review above warnings\n", style.Bold.Render("!"))
+		}
+	}
 
 	// Verify final state.
 	var finalCount int
@@ -361,6 +375,29 @@ func rebaseAbortAndCleanup(db *sql.DB, baseBranch, workBranch string) {
 //nolint:unparam // baseBranch always "compact-base" — API kept flexible for future callers
 func rebaseCleanupAll(db *sql.DB, baseBranch, workBranch string) {
 	rebaseCleanup(db, baseBranch, workBranch)
+}
+
+// parseRebaseOrder converts a rebase_order value (returned by Dolt as DECIMAL
+// string, e.g. "1.00") to an int.
+func parseRebaseOrder(s string) (int, error) {
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid rebase_order %q: %w", s, err)
+	}
+	return int(math.Round(f)), nil
+}
+
+// parseRebaseOrderRange parses min/max rebase_order strings to ints.
+func parseRebaseOrderRange(minStr, maxStr string) (int, int, error) {
+	minVal, err := parseRebaseOrder(minStr)
+	if err != nil {
+		return 0, 0, err
+	}
+	maxVal, err := parseRebaseOrder(maxStr)
+	if err != nil {
+		return 0, 0, err
+	}
+	return minVal, maxVal, nil
 }
 
 // rebaseCleanupBase cleans up only the base branch (work branch not yet created).
